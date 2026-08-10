@@ -8,6 +8,8 @@ const { createClient } = require('@supabase/supabase-js');
 const Razorpay = require('razorpay');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const cron = require('node-cron');
+const { validateOrderAmount, validateChatMessage } = require('./utils');
 
 // ---- Setup connections ----
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -51,6 +53,18 @@ app.post('/api/chat', async (req, res) => {
       .from('daily_menu')
       .select('price_today, quantity_available, menu_items(name, tags, description)')
       .eq('date', today);
+      const queryEmbedding = await embedText(message);
+let semanticMatches = '';
+if (queryEmbedding) {
+  const { data: matches } = await supabase.rpc('match_menu_items', {
+    query_embedding: queryEmbedding,
+    match_threshold: 0.6,
+    match_count: 3,
+  });
+  if (matches && matches.length > 0) {
+    semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
+  }
+}
 
     const { data: todaysDeal } = await supabase
       .from('daily_deals')
@@ -100,7 +114,8 @@ app.post('/api/chat', async (req, res) => {
 
 Today's menu:
 ${menuText || 'No menu has been posted yet today — let the customer know to check back soon.'}
-
+Semantically similar dishes to the customer's query (based on meaning, not just keywords):
+${semanticMatches || 'No strong semantic matches found.'}
 ${dealText}
 
 This customer's past orders (use this to personalize recommendations naturally, don't just list it back robotically):
@@ -185,12 +200,14 @@ app.post('/api/create-order', async (req, res) => {
   try {
     const { items, totalPrice, customerPhone } = req.body;
 
-  if (!totalPrice || totalPrice <= 0 || typeof totalPrice !== 'number') {
-      return res.status(400).json({ error: 'Invalid amount.' });
-    }
-    if (!customerPhone || typeof customerPhone !== 'string' || customerPhone.length < 10) {
-      return res.status(400).json({ error: 'Invalid phone number.' });
-    }
+  const amountCheck = validateOrderAmount(totalPrice);
+if (!amountCheck.valid) {
+  return res.status(400).json({ error: amountCheck.error });
+}
+   const messageCheck = validateChatMessage(message);
+if (!messageCheck.valid) {
+  return res.status(400).json({ error: messageCheck.error });
+}
 
     const razorpayOrder = await razorpay.orders.create({
       amount: totalPrice * 100,
@@ -248,6 +265,19 @@ app.post('/razorpay-webhook', async (req, res) => {
       console.log('ORDER INSERT FAILED:', insertError.message);
     } else {
       console.log('Order successfully inserted into database.');
+      if (!insertError) {
+  const { data: newOrder } = await supabase
+    .from('orders')
+    .select('id')
+    .eq('customer_phone', customerPhone)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single();
+
+  setTimeout(() => {
+    sendRatingRequest(newOrder.id, customerPhone);
+  }, 2 * 60 * 60 * 1000); // 2 hours
+}
     }
 
     const { data: ticketRow, error: ticketFetchError } = await supabase
@@ -399,4 +429,170 @@ app.post('/api/rate-order', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
+});
+
+app.post('/api/generate-embeddings', async (req, res) => {
+  try {
+    const { data: items } = await supabase.from('menu_items').select('*');
+
+    for (const item of items) {
+      const text = `${item.name}. ${item.description || ''}. Tags: ${item.tags || ''}`;
+
+      const embedResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': process.env.GEMINI_API_KEY,
+          },
+          body: JSON.stringify({
+            content: { parts: [{ text }] },
+          }),
+        }
+      );
+      const embedData = await embedResponse.json();
+      const embedding = embedData.embedding?.values;
+
+      if (embedding) {
+        await supabase
+          .from('menu_items')
+          .update({ embedding })
+          .eq('id', item.id);
+        console.log(`Embedded: ${item.name}`);
+      }
+    }
+
+    res.json({ success: true, message: `Embedded ${items.length} menu items.` });
+  } catch (error) {
+    console.error('Embedding generation error:', error);
+    res.status(500).json({ error: 'Failed to generate embeddings.' });
+  }
+});
+
+async function embedText(text) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({ content: { parts: [{ text }] } }),
+    }
+  );
+  const data = await response.json();
+  return data.embedding?.values;
+}
+
+async function sendRatingRequest(orderId, customerPhone) {
+  await fetch(
+    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: customerPhone,
+        text: { body: `Hope you enjoyed your meal! Reply with a rating 1-5 stars for order #${orderId} 🌟` },
+      }),
+    }
+  );
+}
+
+// Runs every day at 5 PM — reminds customers who haven't ordered recently
+async function runReEngagementJob() {
+  console.log('Running daily re-engagement job...');
+
+  const twoWeeksAgo = new Date();
+  twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+  const cutoffDate = twoWeeksAgo.toISOString().split('T')[0];
+
+  const { data: customers } = await supabase.from('customers').select('phone, name');
+
+  let sentCount = 0;
+
+  for (const customer of customers || []) {
+    const { data: lastOrder } = await supabase
+      .from('orders')
+      .select('date')
+      .eq('customer_phone', customer.phone)
+      .eq('status', 'completed')
+      .order('date', { ascending: false })
+      .limit(1)
+      .single();
+
+    const isInactive = lastOrder && lastOrder.date < cutoffDate;
+
+    if (isInactive) {
+      await fetch(
+        `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to: customer.phone,
+            text: { body: `We miss you! Check out this week's menu on Ghardrop 🍛` },
+          }),
+        }
+      );
+      sentCount++;
+    }
+  }
+  console.log(`Re-engagement sent to ${sentCount} customers.`);
+}
+
+// The actual scheduled trigger — runs the function above, daily at 5 PM
+cron.schedule('0 17 * * *', runReEngagementJob);
+app.post('/api/test-reengagement', async (req, res) => {
+  await runReEngagementJob();
+  res.json({ success: true, message: 'Re-engagement job triggered manually.' });
+});
+
+app.get('/api/customer/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('phone', phone)
+      .single();
+
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found.' });
+    }
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('customer_phone', phone)
+      .order('created_at', { ascending: false });
+
+    const { data: ratings } = await supabase
+      .from('ratings')
+      .select('stars, comment, created_at, orders(customer_phone)')
+      .eq('orders.customer_phone', phone);
+
+    const totalSpend = (orders || []).reduce((sum, o) => sum + Number(o.total_price), 0);
+    const totalOrders = (orders || []).length;
+    const lastOrderDate = orders && orders.length > 0 ? orders[0].date : null;
+    const avgRating = ratings && ratings.length > 0
+      ? (ratings.reduce((sum, r) => sum + r.stars, 0) / ratings.length).toFixed(1)
+      : null;
+
+    res.json({
+      customer,
+      totalSpend,
+      totalOrders,
+      lastOrderDate,
+      avgRating,
+      orderHistory: orders || [],
+    });
+  } catch (error) {
+    console.error('Customer profile error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
 });
