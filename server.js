@@ -58,8 +58,8 @@ let semanticMatches = '';
 if (queryEmbedding) {
   const { data: matches } = await supabase.rpc('match_menu_items', {
     query_embedding: queryEmbedding,
-    match_threshold: 0.6,
-    match_count: 3,
+    match_threshold: 0.78,
+    match_count: 2,
   });
   if (matches && matches.length > 0) {
     semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
@@ -114,7 +114,7 @@ if (queryEmbedding) {
 
 Today's menu:
 ${menuText || 'No menu has been posted yet today — let the customer know to check back soon.'}
-Semantically similar dishes to the customer's query (based on meaning, not just keywords):
+Semantically similar dishes to the customer's query (ONLY mention these if the customer's question is actually about food preferences/taste — ignore this section entirely for greetings or general menu questions):
 ${semanticMatches || 'No strong semantic matches found.'}
 ${dealText}
 
@@ -204,10 +204,7 @@ app.post('/api/create-order', async (req, res) => {
 if (!amountCheck.valid) {
   return res.status(400).json({ error: amountCheck.error });
 }
-   const messageCheck = validateChatMessage(message);
-if (!messageCheck.valid) {
-  return res.status(400).json({ error: messageCheck.error });
-}
+  
 
     const razorpayOrder = await razorpay.orders.create({
       amount: totalPrice * 100,
@@ -310,20 +307,22 @@ app.post('/api/daily-menu', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
 
     const dailyMenuRows = items.map((item) => ({
-      date: today,
-      menu_item_id: item.menuItemId,
-      price_today: item.price,
-      quantity_available: item.quantity,
-    }));
+  date: today,
+  menu_item_id: item.menuItemId,
+  price_today: item.price,
+  quantity_available: item.quantity,
+}));
 
-    const { error: menuError } = await supabase.from('daily_menu').insert(dailyMenuRows);
+await supabase.from('daily_menu').delete().eq('date', today);
+const { error: menuError } = await supabase.from('daily_menu').insert(dailyMenuRows);
     if (menuError) {
       console.log('DAILY MENU INSERT FAILED:', menuError.message);
       return res.status(500).json({ error: 'Could not save menu.' });
     }
 
     if (dealTitle) {
-      const { error: dealError } = await supabase.from('daily_deals').insert({
+  await supabase.from('daily_deals').delete().eq('date', today);
+  const { error: dealError } = await supabase.from('daily_deals').insert({
         date: today,
         title: dealTitle,
         items: dealItems,
