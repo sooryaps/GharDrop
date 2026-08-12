@@ -53,8 +53,9 @@ app.post('/api/chat', async (req, res) => {
       .from('daily_menu')
       .select('price_today, quantity_available, menu_items(name, tags, description)')
       .eq('date', today);
-      const queryEmbedding = await embedText(message);
       const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
+      const queryEmbedding = await embedText(message);
+      
 let semanticMatches = '';
 if (queryEmbedding) {
   const { data: matches } = await supabase.rpc('match_menu_items', {
@@ -277,16 +278,18 @@ app.post('/razorpay-webhook', async (req, res) => {
   for (const dishName of dishNames) {
     const { data: menuRow } = await supabase
       .from('daily_menu')
-      .select('id, quantity_available, menu_items!inner(name)')
+      .select('id, menu_items!inner(name)')
       .eq('date', today)
       .eq('menu_items.name', dishName)
       .single();
 
-    if (menuRow && menuRow.quantity_available > 0) {
-      await supabase
-        .from('daily_menu')
-        .update({ quantity_available: menuRow.quantity_available - 1 })
-        .eq('id', menuRow.id);
+    if (menuRow) {
+      const { error: decrementError } = await supabase.rpc('decrement_quantity', {
+        row_id: menuRow.id,
+      });
+      if (decrementError) {
+        console.log(`QUANTITY DECREMENT FAILED for ${dishName}:`, decrementError.message);
+      }
     }
   }
 }
