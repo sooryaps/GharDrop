@@ -54,6 +54,7 @@ app.post('/api/chat', async (req, res) => {
       .select('price_today, quantity_available, menu_items(name, tags, description)')
       .eq('date', today);
       const queryEmbedding = await embedText(message);
+      const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
 let semanticMatches = '';
 if (queryEmbedding) {
   const { data: matches } = await supabase.rpc('match_menu_items', {
@@ -89,7 +90,7 @@ if (queryEmbedding) {
       }
     }
 
-    const menuText = (todaysMenu || [])
+    const menuText = (availableMenu || [])
       .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})`)
       .join('\n');
 
@@ -270,6 +271,25 @@ app.post('/razorpay-webhook', async (req, res) => {
     .order('created_at', { ascending: false })
     .limit(1)
     .single();
+
+    if (!insertError) {
+  const dishNames = items.split(',').map((d) => d.trim());
+  for (const dishName of dishNames) {
+    const { data: menuRow } = await supabase
+      .from('daily_menu')
+      .select('id, quantity_available, menu_items!inner(name)')
+      .eq('date', today)
+      .eq('menu_items.name', dishName)
+      .single();
+
+    if (menuRow && menuRow.quantity_available > 0) {
+      await supabase
+        .from('daily_menu')
+        .update({ quantity_available: menuRow.quantity_available - 1 })
+        .eq('id', menuRow.id);
+    }
+  }
+}
 
   setTimeout(() => {
     sendRatingRequest(newOrder.id, customerPhone);

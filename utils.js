@@ -26,7 +26,9 @@ function validateChatMessage(message) {
   }
   return { valid: true };
 }
-
+function isDishAvailable(quantityAvailable) {
+  return quantityAvailable > 0;
+}
 /**
  * Verifies a Razorpay webhook signature using HMAC-SHA256.
  * Returns true if the signature matches, false otherwise.
