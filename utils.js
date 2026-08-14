@@ -99,12 +99,85 @@ function isCustomerInactive(lastOrderDate, daysThreshold = 14) {
   return lastOrderDate < cutoffStr;
 }
 
+/**
+ * Parses a comma-separated items string (e.g. "Kori Gassi, Boiled Red Rice")
+ * into a clean array of trimmed dish names. Ignores empty entries so a
+ * trailing/stray comma doesn't produce a blank dish name.
+ */
+function parseItemsString(items) {
+  if (!items || typeof items !== 'string') return [];
+  return items
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
+/**
+ * Defines which kitchen_status transitions are legal, so a dashboard click
+ * can't skip states (pending -> delivered) or move a terminal order
+ * backwards (delivered -> preparing).
+ */
+const ALLOWED_STATUS_TRANSITIONS = {
+  pending: ['preparing', 'cancelled'],
+  preparing: ['ready', 'cancelled'],
+  ready: ['delivered'],
+  delivered: [],
+  cancelled: [],
+};
+
+const VALID_KITCHEN_STATUSES = Object.keys(ALLOWED_STATUS_TRANSITIONS);
+
+/**
+ * Validates a requested kitchen_status transition.
+ * Returns { valid: true } or { valid: false, error: '...' }
+ */
+function validateStatusTransition(currentStatus, newStatus) {
+  if (!VALID_KITCHEN_STATUSES.includes(newStatus)) {
+    return { valid: false, error: `"${newStatus}" is not a valid status.` };
+  }
+  if (!VALID_KITCHEN_STATUSES.includes(currentStatus)) {
+    return { valid: false, error: `Order has an unrecognized current status ("${currentStatus}").` };
+  }
+  const allowedNext = ALLOWED_STATUS_TRANSITIONS[currentStatus];
+  if (!allowedNext.includes(newStatus)) {
+    return {
+      valid: false,
+      error: `Cannot move an order from "${currentStatus}" to "${newStatus}".`,
+    };
+  }
+  return { valid: true };
+}
+
+/**
+ * Timing-safe comparison of the owner dashboard token, so an attacker
+ * probing the header can't infer correct characters from response timing.
+ * Returns false (not throw) on any malformed/missing input.
+ */
+function isValidOwnerToken(providedToken, expectedToken) {
+  if (!providedToken || !expectedToken) return false;
+  if (typeof providedToken !== 'string' || typeof expectedToken !== 'string') return false;
+
+  const providedBuf = Buffer.from(providedToken);
+  const expectedBuf = Buffer.from(expectedToken);
+
+  // Lengths must match before calling timingSafeEqual (it throws otherwise).
+  // This length check itself doesn't leak useful timing info since token
+  // length isn't secret in the same way its content is.
+  if (providedBuf.length !== expectedBuf.length) return false;
+
+  return crypto.timingSafeEqual(providedBuf, expectedBuf);
+}
+
 module.exports = {
   validateOrderAmount,
   validateChatMessage,
   isDishAvailable,
   validateQuantity,
   validateRating,
+  parseItemsString,
+  validateStatusTransition,
+  VALID_KITCHEN_STATUSES,
+  isValidOwnerToken,
   verifyWebhookSignature,
   calculateBestSellers,
   isCustomerInactive,

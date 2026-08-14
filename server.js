@@ -14,6 +14,9 @@ const {
   validateChatMessage,
   validateQuantity,
   validateRating,
+  parseItemsString,
+  validateStatusTransition,
+  isValidOwnerToken,
 } = require('./utils');
 
 // ---- Setup connections ----
@@ -40,6 +43,18 @@ app.use('/api/', limiter);
 // ---- Standard middleware ----
 app.use(express.json());
 app.use(cors());
+
+// ---- Owner-only route protection ----
+// Simple shared-secret token, not a full session system — proportional to
+// a single-owner tool. Compared via timing-safe equality (isValidOwnerToken)
+// so the token can't be guessed via response-time differences.
+function requireOwnerAuth(req, res, next) {
+  const token = req.headers['x-owner-token'];
+  if (!isValidOwnerToken(token, process.env.OWNER_DASHBOARD_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+  next();
+}
 
 // ---- Test route ----
 app.get('/', (req, res) => {
@@ -221,6 +236,31 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ---- Helper: checks real-time stock for a list of dish names against
+// today's daily_menu. Returns which dishes (if any) are sold out or don't
+// exist on today's menu at all, so checkout can be blocked before payment.
+async function checkStockAvailability(dishNames, today) {
+  const outOfStock = [];
+  const notFound = [];
+
+  for (const dishName of dishNames) {
+    const { data: menuRow } = await supabase
+      .from('daily_menu')
+      .select('quantity_available, menu_items!inner(name)')
+      .eq('date', today)
+      .eq('menu_items.name', dishName)
+      .single();
+
+    if (!menuRow) {
+      notFound.push(dishName);
+    } else if (menuRow.quantity_available <= 0) {
+      outOfStock.push(dishName);
+    }
+  }
+
+  return { available: outOfStock.length === 0 && notFound.length === 0, outOfStock, notFound };
+}
+
 // ---- Create a Razorpay payment order ----
 app.post('/api/create-order', async (req, res) => {
   try {
@@ -229,6 +269,29 @@ app.post('/api/create-order', async (req, res) => {
     const amountCheck = validateOrderAmount(totalPrice);
     if (!amountCheck.valid) {
       return res.status(400).json({ error: amountCheck.error });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const dishNames = parseItemsString(items);
+
+    if (dishNames.length === 0) {
+      return res.status(400).json({ error: 'No items in order.' });
+    }
+
+    const stockCheck = await checkStockAvailability(dishNames, today);
+    if (!stockCheck.available) {
+      const problems = [];
+      if (stockCheck.outOfStock.length > 0) {
+        problems.push(`out of stock: ${stockCheck.outOfStock.join(', ')}`);
+      }
+      if (stockCheck.notFound.length > 0) {
+        problems.push(`not on today's menu: ${stockCheck.notFound.join(', ')}`);
+      }
+      return res.status(409).json({
+        error: `Sorry, some items can't be ordered right now (${problems.join('; ')}). Please update your order.`,
+        outOfStock: stockCheck.outOfStock,
+        notFound: stockCheck.notFound,
+      });
     }
 
     const razorpayOrder = await razorpay.orders.create({
@@ -318,7 +381,7 @@ app.post('/razorpay-webhook', async (req, res) => {
       .limit(1)
       .single();
 
-    const dishNames = items.split(',').map((d) => d.trim());
+    const dishNames = parseItemsString(items);
     for (const dishName of dishNames) {
       const { data: menuRow } = await supabase
         .from('daily_menu')
@@ -362,7 +425,7 @@ app.post('/razorpay-webhook', async (req, res) => {
 });
 
 // ---- Mom uses this each day to set what's being cooked, prices, and today's deal ----
-app.post('/api/daily-menu', async (req, res) => {
+app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
   try {
     const { items, dealTitle, dealItems, dealPrice, dealOriginalPrice, ticketCap } = req.body;
     const today = new Date().toISOString().split('T')[0];
@@ -422,14 +485,14 @@ app.post('/api/daily-menu', async (req, res) => {
 });
 
 // ---- Fetch the master list of all possible dishes, for the menu upload page ----
-app.get('/api/menu-items', async (req, res) => {
+app.get('/api/menu-items', requireOwnerAuth, async (req, res) => {
   const { data, error } = await supabase.from('menu_items').select('*');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 // ---- Powers the owner dashboard: recent orders, revenue, best-sellers, today's tickets ----
-app.get('/api/dashboard', async (req, res) => {
+app.get('/api/dashboard', requireOwnerAuth, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
 
@@ -480,6 +543,46 @@ app.get('/api/dashboard', async (req, res) => {
   }
 });
 
+// ---- Owner dashboard uses this to move an order through the kitchen
+// lifecycle: pending -> preparing -> ready -> delivered (or -> cancelled
+// from pending/preparing). Rejects illegal jumps via validateStatusTransition.
+app.patch('/api/orders/:id/status', requireOwnerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status: newStatus } = req.body;
+
+    const { data: order, error: fetchError } = await supabase
+      .from('orders')
+      .select('id, kitchen_status')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const transitionCheck = validateStatusTransition(order.kitchen_status, newStatus);
+    if (!transitionCheck.valid) {
+      return res.status(400).json({ error: transitionCheck.error });
+    }
+
+    const { error: updateError } = await supabase
+      .from('orders')
+      .update({ kitchen_status: newStatus })
+      .eq('id', id);
+
+    if (updateError) {
+      console.log('ORDER STATUS UPDATE FAILED:', updateError.message);
+      return res.status(500).json({ error: 'Could not update order status.' });
+    }
+
+    res.json({ success: true, id, kitchen_status: newStatus });
+  } catch (error) {
+    console.error('Order status route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // ---- Customers submit a rating after their order ----
 app.post('/api/rate-order', async (req, res) => {
   try {
@@ -513,7 +616,7 @@ app.post('/api/rate-order', async (req, res) => {
 });
 
 // ---- One-off/admin route: generates embeddings for every menu item ----
-app.post('/api/generate-embeddings', async (req, res) => {
+app.post('/api/generate-embeddings', requireOwnerAuth, async (req, res) => {
   try {
     const { data: items } = await supabase.from('menu_items').select('*');
 
@@ -598,12 +701,12 @@ async function runReEngagementJob() {
 // The actual scheduled trigger — runs the function above, daily at 5 PM
 cron.schedule('0 17 * * *', runReEngagementJob);
 
-app.post('/api/test-reengagement', async (req, res) => {
+app.post('/api/test-reengagement', requireOwnerAuth, async (req, res) => {
   await runReEngagementJob();
   res.json({ success: true, message: 'Re-engagement job triggered manually.' });
 });
 
-app.get('/api/customer/:phone', async (req, res) => {
+app.get('/api/customer/:phone', requireOwnerAuth, async (req, res) => {
   try {
     const { phone } = req.params;
 

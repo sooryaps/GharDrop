@@ -4,6 +4,9 @@ const {
   isDishAvailable,
   validateQuantity,
   validateRating,
+  parseItemsString,
+  validateStatusTransition,
+  isValidOwnerToken,
   verifyWebhookSignature,
   calculateBestSellers,
   isCustomerInactive,
@@ -108,6 +111,101 @@ describe('validateRating', () => {
 
   test('accepts a valid rating', () => {
     expect(validateRating(4).valid).toBe(true);
+  });
+});
+
+// ---- validateStatusTransition ----
+describe('validateStatusTransition', () => {
+  test('allows pending -> preparing', () => {
+    expect(validateStatusTransition('pending', 'preparing').valid).toBe(true);
+  });
+
+  test('allows preparing -> ready', () => {
+    expect(validateStatusTransition('preparing', 'ready').valid).toBe(true);
+  });
+
+  test('allows ready -> delivered', () => {
+    expect(validateStatusTransition('ready', 'delivered').valid).toBe(true);
+  });
+
+  test('allows pending -> cancelled', () => {
+    expect(validateStatusTransition('pending', 'cancelled').valid).toBe(true);
+  });
+
+  test('allows preparing -> cancelled', () => {
+    expect(validateStatusTransition('preparing', 'cancelled').valid).toBe(true);
+  });
+
+  test('rejects skipping straight from pending to delivered', () => {
+    expect(validateStatusTransition('pending', 'delivered').valid).toBe(false);
+  });
+
+  test('rejects cancelling an already-ready order', () => {
+    expect(validateStatusTransition('ready', 'cancelled').valid).toBe(false);
+  });
+
+  test('rejects moving a delivered order anywhere (terminal state)', () => {
+    expect(validateStatusTransition('delivered', 'preparing').valid).toBe(false);
+  });
+
+  test('rejects moving a cancelled order anywhere (terminal state)', () => {
+    expect(validateStatusTransition('cancelled', 'pending').valid).toBe(false);
+  });
+
+  test('rejects an unrecognized target status', () => {
+    expect(validateStatusTransition('pending', 'exploded').valid).toBe(false);
+  });
+
+  test('rejects an unrecognized current status', () => {
+    expect(validateStatusTransition('mystery', 'pending').valid).toBe(false);
+  });
+});
+
+// ---- parseItemsString ----
+describe('parseItemsString', () => {
+  test('parses a normal comma-separated list', () => {
+    expect(parseItemsString('Kori Gassi, Boiled Red Rice')).toEqual(['Kori Gassi', 'Boiled Red Rice']);
+  });
+
+  test('trims extra whitespace around names', () => {
+    expect(parseItemsString('  Neer Dosa  ,   Chicken Sukka ')).toEqual(['Neer Dosa', 'Chicken Sukka']);
+  });
+
+  test('drops empty entries from a trailing comma', () => {
+    expect(parseItemsString('Kori Gassi,')).toEqual(['Kori Gassi']);
+  });
+
+  test('returns an empty array for empty/missing input', () => {
+    expect(parseItemsString('')).toEqual([]);
+    expect(parseItemsString(null)).toEqual([]);
+    expect(parseItemsString(undefined)).toEqual([]);
+  });
+});
+
+// ---- isValidOwnerToken ----
+describe('isValidOwnerToken', () => {
+  test('accepts a matching token', () => {
+    expect(isValidOwnerToken('correct-horse-battery', 'correct-horse-battery')).toBe(true);
+  });
+
+  test('rejects a wrong token of the same length', () => {
+    expect(isValidOwnerToken('correct-horse-batteryX', 'correct-horse-battery1')).toBe(false);
+  });
+
+  test('rejects a wrong token of different length', () => {
+    expect(isValidOwnerToken('short', 'correct-horse-battery')).toBe(false);
+  });
+
+  test('rejects a missing provided token', () => {
+    expect(isValidOwnerToken(undefined, 'correct-horse-battery')).toBe(false);
+  });
+
+  test('rejects a missing expected token (env var not set)', () => {
+    expect(isValidOwnerToken('anything', undefined)).toBe(false);
+  });
+
+  test('rejects a non-string provided token without throwing', () => {
+    expect(isValidOwnerToken(12345, 'correct-horse-battery')).toBe(false);
   });
 });
 
