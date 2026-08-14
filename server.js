@@ -9,7 +9,12 @@ const Razorpay = require('razorpay');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cron = require('node-cron');
-const { validateOrderAmount, validateChatMessage } = require('./utils');
+const {
+  validateOrderAmount,
+  validateChatMessage,
+  validateQuantity,
+  validateRating,
+} = require('./utils');
 
 // ---- Setup connections ----
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -41,33 +46,51 @@ app.get('/', (req, res) => {
   res.send('Ghardrop backend is running!');
 });
 
+// ---- Helper: embed a text string via Gemini's embedding model ----
+async function embedText(text) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({ content: { parts: [{ text }] } }),
+    }
+  );
+  const data = await response.json();
+  return data.embedding?.values;
+}
+
 // ---- Chat route: talks to Gemini, using live menu + customer history ----
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, phone } = req.body;
-    if (!message || typeof message !== 'string' || message.length > 500) {
-      return res.status(400).json({ error: 'Invalid message.' });
+
+    const messageCheck = validateChatMessage(message);
+    if (!messageCheck.valid) {
+      return res.status(400).json({ error: messageCheck.error });
     }
+
     const today = new Date().toISOString().split('T')[0];
 
     const { data: todaysMenu } = await supabase
       .from('daily_menu')
       .select('price_today, quantity_available, menu_items(name, tags, description)')
       .eq('date', today);
-      const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
-      const queryEmbedding = await embedText(message);
-      
-let semanticMatches = '';
-if (queryEmbedding) {
-  const { data: matches } = await supabase.rpc('match_menu_items', {
-    query_embedding: queryEmbedding,
-    match_threshold: 0.78,
-    match_count: 2,
-  });
-  if (matches && matches.length > 0) {
-    semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
-  }
-}
+    const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
+
+    const queryEmbedding = await embedText(message);
+
+    let semanticMatches = '';
+    if (queryEmbedding) {
+      const { data: matches } = await supabase.rpc('match_menu_items', {
+        query_embedding: queryEmbedding,
+        match_threshold: 0.78,
+        match_count: 2,
+      });
+      if (matches && matches.length > 0) {
+        semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
+      }
+    }
 
     const { data: todaysDeal } = await supabase
       .from('daily_deals')
@@ -203,11 +226,10 @@ app.post('/api/create-order', async (req, res) => {
   try {
     const { items, totalPrice, customerPhone } = req.body;
 
-  const amountCheck = validateOrderAmount(totalPrice);
-if (!amountCheck.valid) {
-  return res.status(400).json({ error: amountCheck.error });
-}
-  
+    const amountCheck = validateOrderAmount(totalPrice);
+    if (!amountCheck.valid) {
+      return res.status(400).json({ error: amountCheck.error });
+    }
 
     const razorpayOrder = await razorpay.orders.create({
       amount: totalPrice * 100,
@@ -227,6 +249,25 @@ if (!amountCheck.valid) {
   }
 });
 
+// ---- Helper: sends the post-order rating request over WhatsApp ----
+async function sendRatingRequest(orderId, customerPhone) {
+  await fetch(
+    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: customerPhone,
+        text: { body: `Hope you enjoyed your meal! Reply with a rating 1-5 stars for order #${orderId} 🌟` },
+      }),
+    }
+  );
+}
+
 // ---- Razorpay webhook: confirms real payment, THEN writes to database ----
 app.post('/razorpay-webhook', async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
@@ -245,82 +286,78 @@ app.post('/razorpay-webhook', async (req, res) => {
   res.status(200).send('OK'); // acknowledge immediately
 
   const event = req.body.event;
-  if (event === 'payment.captured') {
-    const payment = req.body.payload.payment.entity;
-    const { items, customerPhone } = payment.notes;
-    const amountRupees = payment.amount / 100;
-    const today = new Date().toISOString().split('T')[0];
+  if (event !== 'payment.captured') {
+    return;
+  }
 
-    console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}`);
+  const payment = req.body.payload.payment.entity;
+  const { items, customerPhone } = payment.notes;
+  const amountRupees = payment.amount / 100;
+  const today = new Date().toISOString().split('T')[0];
 
-    const { error: insertError } = await supabase.from('orders').insert({
-      customer_phone: customerPhone,
-      items: items,
-      total_price: amountRupees,
-      status: 'completed',
-      date: today,
-    });
+  console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}`);
 
-    if (insertError) {
-      console.log('ORDER INSERT FAILED:', insertError.message);
-    } else {
-      console.log('Order successfully inserted into database.');
-      if (!insertError) {
-  const { data: newOrder } = await supabase
-    .from('orders')
-    .select('id')
-    .eq('customer_phone', customerPhone)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
+  const { error: insertError } = await supabase.from('orders').insert({
+    customer_phone: customerPhone,
+    items: items,
+    total_price: amountRupees,
+    status: 'completed',
+    date: today,
+  });
 
-    if (!insertError) {
-  const dishNames = items.split(',').map((d) => d.trim());
-  for (const dishName of dishNames) {
-    const { data: menuRow } = await supabase
-      .from('daily_menu')
-      .select('id, menu_items!inner(name)')
-      .eq('date', today)
-      .eq('menu_items.name', dishName)
+  if (insertError) {
+    console.log('ORDER INSERT FAILED:', insertError.message);
+  } else {
+    console.log('Order successfully inserted into database.');
+
+    const { data: newOrder } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('customer_phone', customerPhone)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .single();
 
-    if (menuRow) {
-      const { error: decrementError } = await supabase.rpc('decrement_quantity', {
-        row_id: menuRow.id,
-      });
-      if (decrementError) {
-        console.log(`QUANTITY DECREMENT FAILED for ${dishName}:`, decrementError.message);
+    const dishNames = items.split(',').map((d) => d.trim());
+    for (const dishName of dishNames) {
+      const { data: menuRow } = await supabase
+        .from('daily_menu')
+        .select('id, menu_items!inner(name)')
+        .eq('date', today)
+        .eq('menu_items.name', dishName)
+        .single();
+
+      if (menuRow) {
+        const { error: decrementError } = await supabase.rpc('decrement_quantity', {
+          row_id: menuRow.id,
+        });
+        if (decrementError) {
+          console.log(`QUANTITY DECREMENT FAILED for ${dishName}:`, decrementError.message);
+        }
       }
+    }
+
+    if (newOrder) {
+      setTimeout(() => {
+        sendRatingRequest(newOrder.id, customerPhone);
+      }, 2 * 60 * 60 * 1000); // 2 hours
     }
   }
-}
 
-  setTimeout(() => {
-    sendRatingRequest(newOrder.id, customerPhone);
-  }, 2 * 60 * 60 * 1000); // 2 hours
-}
-    }
+  // Atomic ticket decrement — fixed 2026-08: previous version did a
+  // read-then-write which could go negative under concurrent payments
+  // or when remaining_count was already 0. decrement_ticket() does the
+  // check-and-decrement in a single SQL statement.
+  const { data: decremented, error: ticketError } = await supabase.rpc('decrement_ticket', {
+    row_date: today,
+  });
 
-    const { data: ticketRow, error: ticketFetchError } = await supabase
-      .from('tickets')
-      .select('remaining_count')
-      .eq('date', today)
-      .single();
-
-    if (ticketFetchError) {
-      console.log('TICKET FETCH FAILED (likely no row exists for today):', ticketFetchError.message);
-    } else if (ticketRow) {
-      const { error: ticketUpdateError } = await supabase
-        .from('tickets')
-        .update({ remaining_count: ticketRow.remaining_count - 1 })
-        .eq('date', today);
-
-      if (ticketUpdateError) {
-        console.log('TICKET UPDATE FAILED:', ticketUpdateError.message);
-      } else {
-        console.log('Ticket count successfully decremented.');
-      }
-    }
+  if (ticketError) {
+    console.log('TICKET DECREMENT FAILED:', ticketError.message);
+  } else if (!decremented) {
+    console.log('Ticket decrement skipped — already at 0 for today (sold out or race avoided).');
+  } else {
+    console.log('Ticket count successfully decremented.');
   }
 });
 
@@ -330,23 +367,39 @@ app.post('/api/daily-menu', async (req, res) => {
     const { items, dealTitle, dealItems, dealPrice, dealOriginalPrice, ticketCap } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    const dailyMenuRows = items.map((item) => ({
-  date: today,
-  menu_item_id: item.menuItemId,
-  price_today: item.price,
-  quantity_available: item.quantity,
-}));
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Menu must include at least one item.' });
+    }
 
-await supabase.from('daily_menu').delete().eq('date', today);
-const { error: menuError } = await supabase.from('daily_menu').insert(dailyMenuRows);
+    // Validate every quantity BEFORE touching the database. Reject the
+    // whole upload on the first bad value rather than partially saving —
+    // this was the confirmed root cause of the negative-quantity bug.
+    for (const item of items) {
+      const quantityCheck = validateQuantity(item.quantity);
+      if (!quantityCheck.valid) {
+        return res.status(400).json({
+          error: `Invalid quantity for item "${item.menuItemId}": ${quantityCheck.error}`,
+        });
+      }
+    }
+
+    const dailyMenuRows = items.map((item) => ({
+      date: today,
+      menu_item_id: item.menuItemId,
+      price_today: item.price,
+      quantity_available: item.quantity,
+    }));
+
+    await supabase.from('daily_menu').delete().eq('date', today);
+    const { error: menuError } = await supabase.from('daily_menu').insert(dailyMenuRows);
     if (menuError) {
       console.log('DAILY MENU INSERT FAILED:', menuError.message);
       return res.status(500).json({ error: 'Could not save menu.' });
     }
 
     if (dealTitle) {
-  await supabase.from('daily_deals').delete().eq('date', today);
-  const { error: dealError } = await supabase.from('daily_deals').insert({
+      await supabase.from('daily_deals').delete().eq('date', today);
+      const { error: dealError } = await supabase.from('daily_deals').insert({
         date: today,
         title: dealTitle,
         items: dealItems,
@@ -432,6 +485,15 @@ app.post('/api/rate-order', async (req, res) => {
   try {
     const { orderId, stars, comment } = req.body;
 
+    if (!orderId) {
+      return res.status(400).json({ error: 'orderId is required.' });
+    }
+
+    const ratingCheck = validateRating(stars);
+    if (!ratingCheck.valid) {
+      return res.status(400).json({ error: ratingCheck.error });
+    }
+
     const { error } = await supabase.from('ratings').insert({
       order_id: orderId,
       stars: stars,
@@ -450,10 +512,7 @@ app.post('/api/rate-order', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
-
+// ---- One-off/admin route: generates embeddings for every menu item ----
 app.post('/api/generate-embeddings', async (req, res) => {
   try {
     const { data: items } = await supabase.from('menu_items').select('*');
@@ -492,37 +551,6 @@ app.post('/api/generate-embeddings', async (req, res) => {
     res.status(500).json({ error: 'Failed to generate embeddings.' });
   }
 });
-
-async function embedText(text) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-      body: JSON.stringify({ content: { parts: [{ text }] } }),
-    }
-  );
-  const data = await response.json();
-  return data.embedding?.values;
-}
-
-async function sendRatingRequest(orderId, customerPhone) {
-  await fetch(
-    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: customerPhone,
-        text: { body: `Hope you enjoyed your meal! Reply with a rating 1-5 stars for order #${orderId} 🌟` },
-      }),
-    }
-  );
-}
 
 // Runs every day at 5 PM — reminds customers who haven't ordered recently
 async function runReEngagementJob() {
@@ -569,6 +597,7 @@ async function runReEngagementJob() {
 
 // The actual scheduled trigger — runs the function above, daily at 5 PM
 cron.schedule('0 17 * * *', runReEngagementJob);
+
 app.post('/api/test-reengagement', async (req, res) => {
   await runReEngagementJob();
   res.json({ success: true, message: 'Re-engagement job triggered manually.' });
@@ -594,6 +623,9 @@ app.get('/api/customer/:phone', async (req, res) => {
       .eq('customer_phone', phone)
       .order('created_at', { ascending: false });
 
+    // NOTE: this filter on a joined table (orders.customer_phone) has not
+    // been verified against real data — flagged for a follow-up check,
+    // not changed here without evidence per project rules.
     const { data: ratings } = await supabase
       .from('ratings')
       .select('stars, comment, created_at, orders(customer_phone)')
@@ -618,4 +650,9 @@ app.get('/api/customer/:phone', async (req, res) => {
     console.error('Customer profile error:', error);
     res.status(500).json({ error: 'Something went wrong.' });
   }
+});
+
+// ---- Start the server (kept as the very last thing in the file) ----
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
 });

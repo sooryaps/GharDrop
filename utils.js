@@ -29,6 +29,34 @@ function validateChatMessage(message) {
 function isDishAvailable(quantityAvailable) {
   return quantityAvailable > 0;
 }
+
+/**
+ * Validates a quantity value before it's inserted into daily_menu.
+ * Rejects (rather than silently clamping) so bad input surfaces as an
+ * error the owner can fix, instead of quietly becoming 0.
+ */
+function validateQuantity(quantity) {
+  if (typeof quantity !== 'number' || Number.isNaN(quantity) || !Number.isInteger(quantity)) {
+    return { valid: false, error: 'Quantity must be a whole number.' };
+  }
+  if (quantity < 0) {
+    return { valid: false, error: 'Quantity cannot be negative.' };
+  }
+  return { valid: true };
+}
+
+/**
+ * Validates a star rating (1-5 integer) before it's inserted into ratings.
+ */
+function validateRating(stars) {
+  if (typeof stars !== 'number' || !Number.isInteger(stars)) {
+    return { valid: false, error: 'Rating must be a whole number.' };
+  }
+  if (stars < 1 || stars > 5) {
+    return { valid: false, error: 'Rating must be between 1 and 5.' };
+  }
+  return { valid: true };
+}
 /**
  * Verifies a Razorpay webhook signature using HMAC-SHA256.
  * Returns true if the signature matches, false otherwise.
@@ -74,6 +102,9 @@ function isCustomerInactive(lastOrderDate, daysThreshold = 14) {
 module.exports = {
   validateOrderAmount,
   validateChatMessage,
+  isDishAvailable,
+  validateQuantity,
+  validateRating,
   verifyWebhookSignature,
   calculateBestSellers,
   isCustomerInactive,

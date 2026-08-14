@@ -1,6 +1,9 @@
 const {
   validateOrderAmount,
   validateChatMessage,
+  isDishAvailable,
+  validateQuantity,
+  validateRating,
   verifyWebhookSignature,
   calculateBestSellers,
   isCustomerInactive,
@@ -44,6 +47,67 @@ describe('validateChatMessage', () => {
 
   test('accepts a normal message', () => {
     expect(validateChatMessage('what is on the menu today?').valid).toBe(true);
+  });
+});
+
+// ---- isDishAvailable ----
+describe('isDishAvailable', () => {
+  test('unavailable at 0', () => {
+    expect(isDishAvailable(0)).toBe(false);
+  });
+
+  test('available above 0', () => {
+    expect(isDishAvailable(5)).toBe(true);
+  });
+});
+
+// ---- validateQuantity ----
+describe('validateQuantity', () => {
+  test('rejects a negative quantity', () => {
+    expect(validateQuantity(-5).valid).toBe(false);
+  });
+
+  test('rejects a non-integer (decimal)', () => {
+    expect(validateQuantity(3.5).valid).toBe(false);
+  });
+
+  test('rejects NaN (e.g. from an empty form field)', () => {
+    expect(validateQuantity(NaN).valid).toBe(false);
+  });
+
+  test('rejects a non-number type', () => {
+    expect(validateQuantity('10').valid).toBe(false);
+  });
+
+  test('accepts zero (sold out, valid state)', () => {
+    expect(validateQuantity(0).valid).toBe(true);
+  });
+
+  test('accepts a valid positive integer', () => {
+    expect(validateQuantity(25).valid).toBe(true);
+  });
+});
+
+// ---- validateRating ----
+describe('validateRating', () => {
+  test('rejects 0 stars', () => {
+    expect(validateRating(0).valid).toBe(false);
+  });
+
+  test('rejects above 5 stars', () => {
+    expect(validateRating(6).valid).toBe(false);
+  });
+
+  test('rejects a decimal rating', () => {
+    expect(validateRating(4.5).valid).toBe(false);
+  });
+
+  test('rejects a non-number type', () => {
+    expect(validateRating('5').valid).toBe(false);
+  });
+
+  test('accepts a valid rating', () => {
+    expect(validateRating(4).valid).toBe(true);
   });
 });
 
