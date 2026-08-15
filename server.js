@@ -248,7 +248,7 @@ async function checkStockAvailability(dishNames, today) {
       .from('daily_menu')
       .select('quantity_available, menu_items!inner(name)')
       .eq('date', today)
-      .eq('menu_items.name', dishName)
+      .ilike('menu_items.name', dishName)
       .single();
 
     if (!menuRow) {
@@ -387,7 +387,7 @@ app.post('/razorpay-webhook', async (req, res) => {
         .from('daily_menu')
         .select('id, menu_items!inner(name)')
         .eq('date', today)
-        .eq('menu_items.name', dishName)
+        .ilike('menu_items.name', dishName)
         .single();
 
       if (menuRow) {
