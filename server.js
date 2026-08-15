@@ -13,8 +13,10 @@ const {
   validateOrderAmount,
   validateChatMessage,
   validateQuantity,
+  validateOrderQuantity,
   validateRating,
-  parseItemsString,
+  parseItemsWithQuantity,
+  formatItemsWithQuantity,
   validateStatusTransition,
   isValidOwnerToken,
 } = require('./utils');
@@ -236,74 +238,105 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ---- Helper: checks real-time stock for a list of dish names against
-// today's daily_menu. Returns which dishes (if any) are sold out or don't
-// exist on today's menu at all, so checkout can be blocked before payment.
-async function checkStockAvailability(dishNames, today) {
-  const outOfStock = [];
-  const notFound = [];
+// ---- Helper: resolves each requested {name, quantity} against today's
+// daily_menu in one place. Returns, per item: whether it exists on today's
+// menu, whether there's enough stock, its real price_today, and its
+// canonical (correctly-cased) name from the database. This is the single
+// source of truth for both the stock check AND the price calculation below
+// — the server trusts nothing the client claims about price or item names.
+async function resolveOrderItems(requestedItems, today) {
+  const resolved = [];
 
-  for (const dishName of dishNames) {
+  for (const item of requestedItems) {
     const { data: menuRow } = await supabase
       .from('daily_menu')
-      .select('quantity_available, menu_items!inner(name)')
+      .select('quantity_available, price_today, menu_items!inner(name)')
       .eq('date', today)
-      .ilike('menu_items.name', dishName)
+      .ilike('menu_items.name', item.name)
       .single();
 
-    if (!menuRow) {
-      notFound.push(dishName);
-    } else if (menuRow.quantity_available <= 0) {
-      outOfStock.push(dishName);
-    }
+    resolved.push({
+      requestedName: item.name,
+      quantity: item.quantity,
+      found: !!menuRow,
+      canonicalName: menuRow ? menuRow.menu_items.name : item.name,
+      priceToday: menuRow ? menuRow.price_today : null,
+      availableQty: menuRow ? menuRow.quantity_available : 0,
+    });
   }
 
-  return { available: outOfStock.length === 0 && notFound.length === 0, outOfStock, notFound };
+  return resolved;
 }
 
 // ---- Create a Razorpay payment order ----
+// SECURITY NOTE: the client sends item names + quantities only. It does
+// NOT send a trusted price — the server always calculates the amount
+// itself from real daily_menu.price_today values, so a tampered request
+// can't pay less than the real total.
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { items, totalPrice, customerPhone } = req.body;
-
-    const amountCheck = validateOrderAmount(totalPrice);
-    if (!amountCheck.valid) {
-      return res.status(400).json({ error: amountCheck.error });
-    }
-
+    const { items, customerPhone } = req.body;
     const today = new Date().toISOString().split('T')[0];
-    const dishNames = parseItemsString(items);
 
-    if (dishNames.length === 0) {
+    const requestedItems = parseItemsWithQuantity(items);
+    if (requestedItems.length === 0) {
       return res.status(400).json({ error: 'No items in order.' });
     }
 
-    const stockCheck = await checkStockAvailability(dishNames, today);
-    if (!stockCheck.available) {
+    // Validate every requested quantity before touching the database.
+    for (const item of requestedItems) {
+      const qtyCheck = validateOrderQuantity(item.quantity);
+      if (!qtyCheck.valid) {
+        return res.status(400).json({ error: `Invalid quantity for "${item.name}": ${qtyCheck.error}` });
+      }
+    }
+
+    const resolvedItems = await resolveOrderItems(requestedItems, today);
+
+    const notFound = resolvedItems.filter((i) => !i.found).map((i) => i.requestedName);
+    const outOfStock = resolvedItems
+      .filter((i) => i.found && i.availableQty < i.quantity)
+      .map((i) => `${i.canonicalName} (wanted ${i.quantity}, ${i.availableQty} left)`);
+
+    if (notFound.length > 0 || outOfStock.length > 0) {
       const problems = [];
-      if (stockCheck.outOfStock.length > 0) {
-        problems.push(`out of stock: ${stockCheck.outOfStock.join(', ')}`);
-      }
-      if (stockCheck.notFound.length > 0) {
-        problems.push(`not on today's menu: ${stockCheck.notFound.join(', ')}`);
-      }
+      if (outOfStock.length > 0) problems.push(`not enough stock: ${outOfStock.join(', ')}`);
+      if (notFound.length > 0) problems.push(`not on today's menu: ${notFound.join(', ')}`);
       return res.status(409).json({
         error: `Sorry, some items can't be ordered right now (${problems.join('; ')}). Please update your order.`,
-        outOfStock: stockCheck.outOfStock,
-        notFound: stockCheck.notFound,
+        outOfStock,
+        notFound,
       });
     }
 
+    // Server-computed total — the only number that ever reaches Razorpay.
+    const totalPrice = resolvedItems.reduce((sum, i) => sum + i.priceToday * i.quantity, 0);
+
+    const amountCheck = validateOrderAmount(totalPrice);
+    if (!amountCheck.valid) {
+      // Realistically only hits if every item is somehow priced at 0.
+      return res.status(400).json({ error: 'Order total is invalid.' });
+    }
+
+    // Store canonical (DB-correct) names + quantities, not whatever the
+    // client typed — keeps the dashboard ledger and downstream decrement
+    // lookups consistent regardless of customer typos/casing.
+    const canonicalItemsString = formatItemsWithQuantity(
+      resolvedItems.map((i) => ({ name: i.canonicalName, quantity: i.quantity }))
+    );
+
     const razorpayOrder = await razorpay.orders.create({
-      amount: totalPrice * 100,
+      amount: Math.round(totalPrice * 100), // paise
       currency: 'INR',
       receipt: `ghardrop_${Date.now()}`,
-      notes: { items, customerPhone },
+      notes: { items: canonicalItemsString, customerPhone },
     });
 
     res.json({
       razorpayOrderId: razorpayOrder.id,
       amount: razorpayOrder.amount,
+      totalPrice,
+      items: canonicalItemsString,
       key: process.env.RAZORPAY_KEY_ID,
     });
   } catch (error) {
@@ -381,8 +414,8 @@ app.post('/razorpay-webhook', async (req, res) => {
       .limit(1)
       .single();
 
-    const dishNames = parseItemsString(items);
-    for (const dishName of dishNames) {
+    const orderedItems = parseItemsWithQuantity(items);
+    for (const { name: dishName, quantity } of orderedItems) {
       const { data: menuRow } = await supabase
         .from('daily_menu')
         .select('id, menu_items!inner(name)')
@@ -391,11 +424,20 @@ app.post('/razorpay-webhook', async (req, res) => {
         .single();
 
       if (menuRow) {
-        const { error: decrementError } = await supabase.rpc('decrement_quantity', {
+        // Atomic: decrements by the real quantity ordered, and the SQL
+        // function's own WHERE clause refuses to go below 0 even under
+        // concurrent requests. See decrement_quantity() in Supabase.
+        const { data: decremented, error: decrementError } = await supabase.rpc('decrement_quantity', {
           row_id: menuRow.id,
+          amount: quantity,
         });
         if (decrementError) {
-          console.log(`QUANTITY DECREMENT FAILED for ${dishName}:`, decrementError.message);
+          console.log(`QUANTITY DECREMENT FAILED for ${dishName} x${quantity}:`, decrementError.message);
+        } else if (!decremented) {
+          // Payment already succeeded — money moved — but stock ran out
+          // between checkout and this webhook (race condition). This is
+          // a real oversell that needs a human, not a silent failure.
+          console.log(`OVERSOLD: ${dishName} x${quantity} — payment captured but insufficient stock at decrement time. Manual review needed for order from ${customerPhone}.`);
         }
       }
     }

@@ -3,8 +3,11 @@ const {
   validateChatMessage,
   isDishAvailable,
   validateQuantity,
+  validateOrderQuantity,
   validateRating,
   parseItemsString,
+  parseItemsWithQuantity,
+  formatItemsWithQuantity,
   validateStatusTransition,
   isValidOwnerToken,
   verifyWebhookSignature,
@@ -61,6 +64,33 @@ describe('isDishAvailable', () => {
 
   test('available above 0', () => {
     expect(isDishAvailable(5)).toBe(true);
+  });
+});
+
+// ---- validateOrderQuantity ----
+describe('validateOrderQuantity', () => {
+  test('rejects 0 (an order line needs at least 1)', () => {
+    expect(validateOrderQuantity(0).valid).toBe(false);
+  });
+
+  test('rejects a negative quantity', () => {
+    expect(validateOrderQuantity(-2).valid).toBe(false);
+  });
+
+  test('rejects a non-integer', () => {
+    expect(validateOrderQuantity(1.5).valid).toBe(false);
+  });
+
+  test('rejects an unrealistically large quantity', () => {
+    expect(validateOrderQuantity(500).valid).toBe(false);
+  });
+
+  test('accepts a normal quantity', () => {
+    expect(validateOrderQuantity(2).valid).toBe(true);
+  });
+
+  test('accepts quantity of 1', () => {
+    expect(validateOrderQuantity(1).valid).toBe(true);
   });
 });
 
@@ -161,6 +191,60 @@ describe('validateStatusTransition', () => {
   });
 });
 
+// ---- parseItemsWithQuantity ----
+describe('parseItemsWithQuantity', () => {
+  test('parses a quantity suffix', () => {
+    expect(parseItemsWithQuantity('Neer Dosa (4pc) x2')).toEqual([
+      { name: 'Neer Dosa (4pc)', quantity: 2 },
+    ]);
+  });
+
+  test('defaults to quantity 1 when no suffix (old order format)', () => {
+    expect(parseItemsWithQuantity('Kori Gassi, Boiled Red Rice')).toEqual([
+      { name: 'Kori Gassi', quantity: 1 },
+      { name: 'Boiled Red Rice', quantity: 1 },
+    ]);
+  });
+
+  test('handles a mix of quantified and plain items', () => {
+    expect(parseItemsWithQuantity('Neer Dosa (4pc) x3, Kori Gassi')).toEqual([
+      { name: 'Neer Dosa (4pc)', quantity: 3 },
+      { name: 'Kori Gassi', quantity: 1 },
+    ]);
+  });
+
+  test('returns an empty array for empty input', () => {
+    expect(parseItemsWithQuantity('')).toEqual([]);
+  });
+});
+
+// ---- formatItemsWithQuantity ----
+describe('formatItemsWithQuantity', () => {
+  test('omits x1 for single quantities (matches old format)', () => {
+    expect(formatItemsWithQuantity([{ name: 'Kori Gassi', quantity: 1 }])).toBe('Kori Gassi');
+  });
+
+  test('includes xN for quantities above 1', () => {
+    expect(formatItemsWithQuantity([{ name: 'Neer Dosa (4pc)', quantity: 2 }])).toBe('Neer Dosa (4pc) x2');
+  });
+
+  test('formats multiple items correctly', () => {
+    expect(
+      formatItemsWithQuantity([
+        { name: 'Neer Dosa (4pc)', quantity: 2 },
+        { name: 'Kori Gassi', quantity: 1 },
+      ])
+    ).toBe('Neer Dosa (4pc) x2, Kori Gassi');
+  });
+
+  test('round-trips through parseItemsWithQuantity', () => {
+    const original = 'Neer Dosa (4pc) x3, Kori Gassi x1, Boiled Red Rice';
+    const parsed = parseItemsWithQuantity(original);
+    const formatted = formatItemsWithQuantity(parsed);
+    expect(parseItemsWithQuantity(formatted)).toEqual(parsed);
+  });
+});
+
 // ---- parseItemsString ----
 describe('parseItemsString', () => {
   test('parses a normal comma-separated list', () => {
@@ -252,6 +336,16 @@ describe('calculateBestSellers', () => {
     ];
     const result = calculateBestSellers(orders, 3);
     expect(result.length).toBe(3);
+  });
+
+  test('sums real quantities, not just occurrence count', () => {
+    const orders = [
+      { items: 'Neer Dosa (4pc) x3, Kori Gassi' },
+      { items: 'Neer Dosa (4pc) x2' },
+    ];
+    const result = calculateBestSellers(orders);
+    expect(result[0].name).toBe('Neer Dosa (4pc)');
+    expect(result[0].count).toBe(5); // 3 + 2, not 2 occurrences
   });
 });
 

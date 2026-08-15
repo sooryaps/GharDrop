@@ -70,15 +70,41 @@ function verifyWebhookSignature(body, signature, secret) {
 }
 
 /**
- * Calculates best-selling dishes from a list of orders.
- * Each order has an `items` field like "Kori Gassi, Boiled Red Rice".
+ * Parses an items string that may include per-dish quantities, e.g.
+ * "Neer Dosa (4pc) x2, Kori Gassi" -> [{ name: 'Neer Dosa (4pc)', quantity: 2 }, { name: 'Kori Gassi', quantity: 1 }]
+ * A dish with no "xN" suffix defaults to quantity 1, so this stays
+ * backward-compatible with every order created before quantities existed.
+ */
+function parseItemsWithQuantity(items) {
+  return parseItemsString(items).map((entry) => {
+    const match = entry.match(/^(.*)\sx(\d+)$/i);
+    if (match) {
+      return { name: match[1].trim(), quantity: parseInt(match[2], 10) };
+    }
+    return { name: entry, quantity: 1 };
+  });
+}
+
+/**
+ * Formats an array of { name, quantity } back into the stored items string.
+ * Quantity of 1 is omitted (matches the old plain-name format) so ledgers
+ * stay readable for the common single-item case.
+ */
+function formatItemsWithQuantity(items) {
+  return items
+    .map((item) => (item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name))
+    .join(', ');
+}
+
+/**
+ * Calculates best-selling dishes from a list of orders, counting real
+ * quantities sold (e.g. "Neer Dosa x3" contributes 3, not 1).
  */
 function calculateBestSellers(orders, topN = 6) {
   const dishCounts = {};
   orders.forEach((order) => {
-    order.items.split(',').forEach((item) => {
-      const name = item.trim();
-      dishCounts[name] = (dishCounts[name] || 0) + 1;
+    parseItemsWithQuantity(order.items).forEach(({ name, quantity }) => {
+      dishCounts[name] = (dishCounts[name] || 0) + quantity;
     });
   });
   return Object.entries(dishCounts)
@@ -168,13 +194,34 @@ function isValidOwnerToken(providedToken, expectedToken) {
   return crypto.timingSafeEqual(providedBuf, expectedBuf);
 }
 
+/**
+ * Validates a quantity requested WITHIN an order (e.g. "2 neer dosa").
+ * Unlike validateQuantity (menu stock, which can legitimately be 0),
+ * an order line must request at least 1 of something.
+ */
+function validateOrderQuantity(quantity) {
+  if (typeof quantity !== 'number' || Number.isNaN(quantity) || !Number.isInteger(quantity)) {
+    return { valid: false, error: 'Quantity must be a whole number.' };
+  }
+  if (quantity < 1) {
+    return { valid: false, error: 'Quantity must be at least 1.' };
+  }
+  if (quantity > 50) {
+    return { valid: false, error: 'Quantity per item seems unrealistically high — please double check.' };
+  }
+  return { valid: true };
+}
+
 module.exports = {
   validateOrderAmount,
   validateChatMessage,
   isDishAvailable,
   validateQuantity,
+  validateOrderQuantity,
   validateRating,
   parseItemsString,
+  parseItemsWithQuantity,
+  formatItemsWithQuantity,
   validateStatusTransition,
   VALID_KITCHEN_STATUSES,
   isValidOwnerToken,
