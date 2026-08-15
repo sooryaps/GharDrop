@@ -8,6 +8,8 @@ const {
   parseItemsString,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
+  parseOrderIntentResponse,
+  matchDishName,
   validateStatusTransition,
   isValidOwnerToken,
   verifyWebhookSignature,
@@ -64,6 +66,105 @@ describe('isDishAvailable', () => {
 
   test('available above 0', () => {
     expect(isDishAvailable(5)).toBe(true);
+  });
+});
+
+// ---- parseOrderIntentResponse ----
+describe('parseOrderIntentResponse', () => {
+  test('parses a clean order-intent response', () => {
+    const raw = '{"isOrder": true, "items": [{"name": "Neer Dosa", "quantity": 2}]}';
+    const result = parseOrderIntentResponse(raw);
+    expect(result.valid).toBe(true);
+    expect(result.data).toEqual({ isOrder: true, items: [{ name: 'Neer Dosa', quantity: 2 }] });
+  });
+
+  test('parses a clean non-order response', () => {
+    const raw = '{"isOrder": false, "items": []}';
+    const result = parseOrderIntentResponse(raw);
+    expect(result.valid).toBe(true);
+    expect(result.data.isOrder).toBe(false);
+  });
+
+  test('strips markdown code fences around the JSON', () => {
+    const raw = '```json\n{"isOrder": true, "items": [{"name": "Kori Gassi", "quantity": 1}]}\n```';
+    const result = parseOrderIntentResponse(raw);
+    expect(result.valid).toBe(true);
+    expect(result.data.items[0].name).toBe('Kori Gassi');
+  });
+
+  test('rejects malformed JSON instead of throwing', () => {
+    const result = parseOrderIntentResponse('this is not json at all');
+    expect(result.valid).toBe(false);
+  });
+
+  test('rejects a JSON array at the top level', () => {
+    const result = parseOrderIntentResponse('[1,2,3]');
+    expect(result.valid).toBe(false);
+  });
+
+  test('rejects a response missing isOrder', () => {
+    const result = parseOrderIntentResponse('{"items": []}');
+    expect(result.valid).toBe(false);
+  });
+
+  test('rejects isOrder: true with a missing items array', () => {
+    const result = parseOrderIntentResponse('{"isOrder": true}');
+    expect(result.valid).toBe(false);
+  });
+
+  test('treats isOrder: true with an empty items array as not an order (contradictory)', () => {
+    const result = parseOrderIntentResponse('{"isOrder": true, "items": []}');
+    expect(result.valid).toBe(true);
+    expect(result.data.isOrder).toBe(false);
+  });
+
+  test('rejects an item with a non-string name', () => {
+    const raw = '{"isOrder": true, "items": [{"name": 123, "quantity": 1}]}';
+    expect(parseOrderIntentResponse(raw).valid).toBe(false);
+  });
+
+  test('rejects an item with a zero or negative quantity', () => {
+    const raw = '{"isOrder": true, "items": [{"name": "Kori Gassi", "quantity": 0}]}';
+    expect(parseOrderIntentResponse(raw).valid).toBe(false);
+  });
+
+  test('rejects an item with a non-integer quantity', () => {
+    const raw = '{"isOrder": true, "items": [{"name": "Kori Gassi", "quantity": 1.5}]}';
+    expect(parseOrderIntentResponse(raw).valid).toBe(false);
+  });
+
+  test('rejects null/empty input without throwing', () => {
+    expect(parseOrderIntentResponse(null).valid).toBe(false);
+    expect(parseOrderIntentResponse('').valid).toBe(false);
+    expect(parseOrderIntentResponse(undefined).valid).toBe(false);
+  });
+});
+
+// ---- matchDishName ----
+describe('matchDishName', () => {
+  const menu = ['Neer Dosa (4pc)', 'Kori Gassi', 'Boiled Red Rice', 'Chicken Sukka'];
+
+  test('matches an exact (case-insensitive) name', () => {
+    expect(matchDishName('kori gassi', menu)).toBe('Kori Gassi');
+  });
+
+  test('matches via unambiguous prefix', () => {
+    expect(matchDishName('neer dosa', menu)).toBe('Neer Dosa (4pc)');
+  });
+
+  test('returns null for a name not on the menu at all', () => {
+    expect(matchDishName('Butter Chicken', menu)).toBeNull();
+  });
+
+  test('returns null (refuses to guess) when prefix is ambiguous between two dishes', () => {
+    const ambiguousMenu = ['Neer Dosa (4pc)', 'Neer Dosa (2pc)'];
+    expect(matchDishName('neer dosa', ambiguousMenu)).toBeNull();
+  });
+
+  test('returns null for empty/missing input', () => {
+    expect(matchDishName('', menu)).toBeNull();
+    expect(matchDishName(null, menu)).toBeNull();
+    expect(matchDishName('Kori Gassi', [])).toBeNull();
   });
 });
 

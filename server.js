@@ -17,6 +17,8 @@ const {
   validateRating,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
+  parseOrderIntentResponse,
+  matchDishName,
   validateStatusTransition,
   isValidOwnerToken,
 } = require('./utils');
@@ -75,6 +77,90 @@ async function embedText(text) {
   );
   const data = await response.json();
   return data.embedding?.values;
+}
+
+// ---- Helper: detects whether an incoming message is an order request,
+// and if so, extracts {name, quantity} pairs — matched against the REAL
+// menu, not just whatever the AI says. This function never creates an
+// order itself; it only classifies intent. Every extracted item still
+// has to pass resolveOrderItems' live stock/price check later, same as
+// any other checkout. Fails safe: any parsing ambiguity, malformed AI
+// output, or unmatched dish name results in isOrder: false rather than
+// a guess, so a misfire never accidentally creates a payment link.
+async function detectOrderIntent(message, availableMenuNames) {
+  if (availableMenuNames.length === 0) {
+    // Nothing is being sold today — there's nothing to order, don't
+    // even bother calling the AI.
+    return { isOrder: false, items: [], unmatchedNames: [] };
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: message }] }],
+          systemInstruction: {
+            parts: [
+              {
+                text: `You classify a customer WhatsApp message for a food ordering system. Reply with ONLY raw JSON, no markdown, no explanation, matching exactly this shape:
+{"isOrder": boolean, "items": [{"name": string, "quantity": integer}]}
+
+Rules:
+- Only set isOrder: true if the customer is clearly trying to place/confirm an order (e.g. "I want 2 neer dosa", "give me kori gassi", "2 of that please").
+- Questions, greetings, or general chat about the menu are isOrder: false with an empty items array.
+- Every "name" in items MUST be copied exactly from this list of today's actual available dishes — never invent or guess a dish name that isn't in this list:
+${availableMenuNames.map((n) => `- ${n}`).join('\n')}
+- If the customer's message doesn't clearly map to one of the dishes above, do not include it as an item.
+- Default quantity to 1 if the customer didn't specify a number.`,
+              },
+            ],
+          },
+          generationConfig: { maxOutputTokens: 512 },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    const parsed = parseOrderIntentResponse(rawText);
+    if (!parsed.valid || !parsed.data.isOrder) {
+      return { isOrder: false, items: [], unmatchedNames: [] };
+    }
+
+    // Second, independent check: match every AI-claimed name against the
+    // real menu ourselves. If the AI hallucinated a name despite
+    // instructions, matchDishName returns null for it and we drop it —
+    // we never trust the AI's word alone that a name is real.
+    const matchedItems = [];
+    const unmatchedNames = [];
+    for (const item of parsed.data.items) {
+      const matched = matchDishName(item.name, availableMenuNames);
+      if (matched) {
+        matchedItems.push({ name: matched, quantity: item.quantity });
+      } else {
+        unmatchedNames.push(item.name);
+      }
+    }
+
+    if (matchedItems.length === 0) {
+      return { isOrder: false, items: [], unmatchedNames };
+    }
+
+    return { isOrder: true, items: matchedItems, unmatchedNames };
+  } catch (error) {
+    console.error('Order intent detection error:', error);
+    // Any failure (network, parsing, unexpected shape) fails safe to
+    // "not an order" — worst case the customer gets a normal chat reply
+    // instead of an order, never the reverse.
+    return { isOrder: false, items: [], unmatchedNames: [] };
+  }
 }
 
 // ---- Chat route: talks to Gemini, using live menu + customer history ----

@@ -212,6 +212,101 @@ function validateOrderQuantity(quantity) {
   return { valid: true };
 }
 
+/**
+ * Safely parses and validates the JSON Gemini is asked to return for
+ * order-intent detection. Handles the common failure modes of LLM
+ * "structured output": markdown code fences around the JSON, extra
+ * prose before/after, missing fields, or wrong types. Never throws —
+ * always returns a validated shape or a clear reason it failed, so a
+ * malformed AI response degrades to "treat as not an order" rather than
+ * crashing or (worse) being trusted blindly.
+ */
+function parseOrderIntentResponse(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return { valid: false, error: 'Empty or non-string response.' };
+  }
+
+  // Strip common markdown code-fence wrapping (```json ... ``` or ``` ... ```)
+  const stripped = rawText.replace(/```json\s*|```\s*/g, '').trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch (e) {
+    return { valid: false, error: 'Response was not valid JSON.' };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { valid: false, error: 'Response was not a JSON object.' };
+  }
+
+  if (typeof parsed.isOrder !== 'boolean') {
+    return { valid: false, error: 'Missing or invalid "isOrder" field.' };
+  }
+
+  if (!parsed.isOrder) {
+    return { valid: true, data: { isOrder: false, items: [] } };
+  }
+
+  if (!Array.isArray(parsed.items)) {
+    return { valid: false, error: 'Missing or invalid "items" array.' };
+  }
+
+  const cleanItems = [];
+  for (const item of parsed.items) {
+    if (
+      !item ||
+      typeof item.name !== 'string' ||
+      item.name.trim().length === 0 ||
+      typeof item.quantity !== 'number' ||
+      !Number.isInteger(item.quantity) ||
+      item.quantity < 1
+    ) {
+      return { valid: false, error: `Malformed item in response: ${JSON.stringify(item)}` };
+    }
+    cleanItems.push({ name: item.name.trim(), quantity: item.quantity });
+  }
+
+  if (cleanItems.length === 0) {
+    // isOrder: true but no items is contradictory — treat as not an order
+    // rather than guessing what was meant.
+    return { valid: true, data: { isOrder: false, items: [] } };
+  }
+
+  return { valid: true, data: { isOrder: true, items: cleanItems } };
+}
+
+/**
+ * Matches an AI-extracted (possibly imperfect) dish name against the real
+ * list of today's menu item names. This is a safety net independent of
+ * how well the AI followed instructions to only use real menu names —
+ * it never invents a match for something that isn't actually on the menu.
+ *
+ * Match order: exact (case-insensitive) match first, then a "menu name
+ * starts with the requested name" match (handles "neer dosa" matching
+ * "Neer Dosa (4pc)"). Returns null if nothing reasonably matches — the
+ * caller should treat that as "ask the customer to clarify," never as
+ * a silent guess.
+ */
+function matchDishName(requestedName, menuNames) {
+  if (!requestedName || !Array.isArray(menuNames) || menuNames.length === 0) return null;
+
+  const normalizedRequest = requestedName.trim().toLowerCase();
+
+  const exactMatch = menuNames.find((name) => name.toLowerCase() === normalizedRequest);
+  if (exactMatch) return exactMatch;
+
+  const prefixMatches = menuNames.filter((name) =>
+    name.toLowerCase().startsWith(normalizedRequest)
+  );
+  // Only auto-match if exactly one menu item starts with the requested
+  // name — if it's ambiguous (e.g. two dishes both start with "Neer"),
+  // refuse to guess rather than silently picking one.
+  if (prefixMatches.length === 1) return prefixMatches[0];
+
+  return null;
+}
+
 module.exports = {
   validateOrderAmount,
   validateChatMessage,
@@ -222,6 +317,8 @@ module.exports = {
   parseItemsString,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
+  parseOrderIntentResponse,
+  matchDishName,
   validateStatusTransition,
   VALID_KITCHEN_STATUSES,
   isValidOwnerToken,
