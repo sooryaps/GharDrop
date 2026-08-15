@@ -711,6 +711,40 @@ app.patch('/api/orders/:id/status', requireOwnerAuth, async (req, res) => {
   }
 });
 
+// ---- TEST-ONLY: manually verify order-intent detection against today's
+// real menu, before it's wired into the live WhatsApp webhook. Owner-only.
+// Safe to remove once Phase 5 (webhook wiring) is done and confirmed live.
+app.post('/api/test-order-intent', requireOwnerAuth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    const messageCheck = validateChatMessage(message);
+    if (!messageCheck.valid) {
+      return res.status(400).json({ error: messageCheck.error });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const { data: todaysMenu } = await supabase
+      .from('daily_menu')
+      .select('quantity_available, menu_items(name)')
+      .eq('date', today);
+
+    const availableMenuNames = (todaysMenu || [])
+      .filter((item) => item.quantity_available > 0)
+      .map((item) => item.menu_items.name);
+
+    const result = await detectOrderIntent(message, availableMenuNames);
+
+    res.json({
+      message,
+      todaysAvailableMenu: availableMenuNames,
+      detectionResult: result,
+    });
+  } catch (error) {
+    console.error('Order intent test route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // ---- Customers submit a rating after their order ----
 app.post('/api/rate-order', async (req, res) => {
   try {
