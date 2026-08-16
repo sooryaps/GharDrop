@@ -1046,6 +1046,29 @@ app.get('/api/daily-menu/yesterday', requireOwnerAuth, async (req, res) => {
   }
 });
 
+// ---- Lightweight endpoint for the Kitchen View — today's orders that
+// still need action (pending/preparing/ready), nothing else. No revenue,
+// no best-sellers, no CRM data — just what needs cooking right now. ----
+app.get('/api/kitchen-orders', requireOwnerAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('id, items, kitchen_status, created_at, customer_phone')
+      .eq('date', today)
+      .in('kitchen_status', ['pending', 'preparing', 'ready'])
+      .order('created_at', { ascending: true }); // oldest first — cook in order received
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ orders: orders || [] });
+  } catch (error) {
+    console.error('Kitchen orders route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // ---- Powers the owner dashboard: recent orders, revenue, best-sellers, today's tickets ----
 app.get('/api/dashboard', requireOwnerAuth, async (req, res) => {
   try {
