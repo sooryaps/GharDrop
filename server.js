@@ -55,19 +55,6 @@ app.use(cors());
 function requireOwnerAuth(req, res, next) {
   const token = req.headers['x-owner-token'];
   if (!isValidOwnerToken(token, process.env.OWNER_DASHBOARD_TOKEN)) {
-    // TEMPORARY DEBUG — remove once the mismatch is found. Deliberately
-    // logs only lengths and edge characters, never the full token values,
-    // so the real secret never ends up sitting in Railway's logs.
-    const expected = process.env.OWNER_DASHBOARD_TOKEN || '';
-    console.log('AUTH DEBUG:', {
-      receivedLength: token ? token.length : 0,
-      expectedLength: expected.length,
-      receivedFirst3: token ? token.slice(0, 3) : null,
-      receivedLast3: token ? token.slice(-3) : null,
-      expectedFirst3: expected.slice(0, 3),
-      expectedLast3: expected.slice(-3),
-      route: req.path,
-    });
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   next();
@@ -367,80 +354,134 @@ async function resolveOrderItems(requestedItems, today) {
   return resolved;
 }
 
-// ---- Create a Razorpay payment order ----
+// ---- Helper: validates AND prices an order from raw item names+quantities.
+// This is the single, shared security gate for EVERY way a customer can pay
+// (browser checkout, WhatsApp Payment Link, any future entry point) — they
+// all call this same function so stock/price rules can never drift apart
+// between different payment flows. Returns either a ready-to-charge order
+// or a structured error describing exactly what's wrong.
+async function validateAndPriceOrder(items, today) {
+  const requestedItems = parseItemsWithQuantity(items);
+  if (requestedItems.length === 0) {
+    return { ok: false, status: 400, error: 'No items in order.' };
+  }
+
+  for (const item of requestedItems) {
+    const qtyCheck = validateOrderQuantity(item.quantity);
+    if (!qtyCheck.valid) {
+      return { ok: false, status: 400, error: `Invalid quantity for "${item.name}": ${qtyCheck.error}` };
+    }
+  }
+
+  const resolvedItems = await resolveOrderItems(requestedItems, today);
+
+  const notFound = resolvedItems.filter((i) => !i.found).map((i) => i.requestedName);
+  const outOfStock = resolvedItems
+    .filter((i) => i.found && i.availableQty < i.quantity)
+    .map((i) => `${i.canonicalName} (wanted ${i.quantity}, ${i.availableQty} left)`);
+
+  if (notFound.length > 0 || outOfStock.length > 0) {
+    const problems = [];
+    if (outOfStock.length > 0) problems.push(`not enough stock: ${outOfStock.join(', ')}`);
+    if (notFound.length > 0) problems.push(`not on today's menu: ${notFound.join(', ')}`);
+    return {
+      ok: false,
+      status: 409,
+      error: `Sorry, some items can't be ordered right now (${problems.join('; ')}). Please update your order.`,
+      outOfStock,
+      notFound,
+    };
+  }
+
+  // Server-computed total — the only number that ever reaches Razorpay,
+  // regardless of which entry point (browser or WhatsApp) is charging.
+  const totalPrice = resolvedItems.reduce((sum, i) => sum + i.priceToday * i.quantity, 0);
+
+  const amountCheck = validateOrderAmount(totalPrice);
+  if (!amountCheck.valid) {
+    return { ok: false, status: 400, error: 'Order total is invalid.' };
+  }
+
+  const canonicalItemsString = formatItemsWithQuantity(
+    resolvedItems.map((i) => ({ name: i.canonicalName, quantity: i.quantity }))
+  );
+
+  return { ok: true, totalPrice, canonicalItemsString };
+}
+
+// ---- Create a Razorpay payment order (browser/Checkout.js flow) ----
 // SECURITY NOTE: the client sends item names + quantities only. It does
-// NOT send a trusted price — the server always calculates the amount
-// itself from real daily_menu.price_today values, so a tampered request
-// can't pay less than the real total.
+// NOT send a trusted price — validateAndPriceOrder always calculates the
+// amount itself from real daily_menu.price_today values.
 app.post('/api/create-order', async (req, res) => {
   try {
     const { items, customerPhone } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    const requestedItems = parseItemsWithQuantity(items);
-    if (requestedItems.length === 0) {
-      return res.status(400).json({ error: 'No items in order.' });
+    const priced = await validateAndPriceOrder(items, today);
+    if (!priced.ok) {
+      return res.status(priced.status).json({ error: priced.error, outOfStock: priced.outOfStock, notFound: priced.notFound });
     }
-
-    // Validate every requested quantity before touching the database.
-    for (const item of requestedItems) {
-      const qtyCheck = validateOrderQuantity(item.quantity);
-      if (!qtyCheck.valid) {
-        return res.status(400).json({ error: `Invalid quantity for "${item.name}": ${qtyCheck.error}` });
-      }
-    }
-
-    const resolvedItems = await resolveOrderItems(requestedItems, today);
-
-    const notFound = resolvedItems.filter((i) => !i.found).map((i) => i.requestedName);
-    const outOfStock = resolvedItems
-      .filter((i) => i.found && i.availableQty < i.quantity)
-      .map((i) => `${i.canonicalName} (wanted ${i.quantity}, ${i.availableQty} left)`);
-
-    if (notFound.length > 0 || outOfStock.length > 0) {
-      const problems = [];
-      if (outOfStock.length > 0) problems.push(`not enough stock: ${outOfStock.join(', ')}`);
-      if (notFound.length > 0) problems.push(`not on today's menu: ${notFound.join(', ')}`);
-      return res.status(409).json({
-        error: `Sorry, some items can't be ordered right now (${problems.join('; ')}). Please update your order.`,
-        outOfStock,
-        notFound,
-      });
-    }
-
-    // Server-computed total — the only number that ever reaches Razorpay.
-    const totalPrice = resolvedItems.reduce((sum, i) => sum + i.priceToday * i.quantity, 0);
-
-    const amountCheck = validateOrderAmount(totalPrice);
-    if (!amountCheck.valid) {
-      // Realistically only hits if every item is somehow priced at 0.
-      return res.status(400).json({ error: 'Order total is invalid.' });
-    }
-
-    // Store canonical (DB-correct) names + quantities, not whatever the
-    // client typed — keeps the dashboard ledger and downstream decrement
-    // lookups consistent regardless of customer typos/casing.
-    const canonicalItemsString = formatItemsWithQuantity(
-      resolvedItems.map((i) => ({ name: i.canonicalName, quantity: i.quantity }))
-    );
 
     const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(totalPrice * 100), // paise
+      amount: Math.round(priced.totalPrice * 100), // paise
       currency: 'INR',
       receipt: `ghardrop_${Date.now()}`,
-      notes: { items: canonicalItemsString, customerPhone },
+      notes: { items: priced.canonicalItemsString, customerPhone },
     });
 
     res.json({
       razorpayOrderId: razorpayOrder.id,
       amount: razorpayOrder.amount,
-      totalPrice,
-      items: canonicalItemsString,
+      totalPrice: priced.totalPrice,
+      items: priced.canonicalItemsString,
       key: process.env.RAZORPAY_KEY_ID,
     });
   } catch (error) {
     console.error('Payment order creation error:', error);
     res.status(500).json({ error: 'Could not create payment order.' });
+  }
+});
+
+// ---- Create a Razorpay Payment Link (WhatsApp flow) ----
+// Same validateAndPriceOrder gate as /api/create-order — a WhatsApp order
+// is priced and stock-checked exactly the same way a browser order is.
+// Produces a plain https://rzp.io/... URL that works inside a WhatsApp
+// text message (Checkout.js's popup widget does not).
+app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
+  try {
+    const { items, customerPhone } = req.body;
+
+    if (!customerPhone || typeof customerPhone !== 'string') {
+      return res.status(400).json({ error: 'customerPhone is required.' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+
+    const priced = await validateAndPriceOrder(items, today);
+    if (!priced.ok) {
+      return res.status(priced.status).json({ error: priced.error, outOfStock: priced.outOfStock, notFound: priced.notFound });
+    }
+
+    const paymentLink = await razorpay.paymentLink.create({
+      amount: Math.round(priced.totalPrice * 100), // paise
+      currency: 'INR',
+      description: priced.canonicalItemsString,
+      reference_id: `ghardrop_${Date.now()}`.slice(0, 40), // Razorpay caps reference_id at 40 chars
+      customer: { contact: customerPhone },
+      notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
+      notes: { items: priced.canonicalItemsString, customerPhone },
+    });
+
+    res.json({
+      paymentLinkId: paymentLink.id,
+      shortUrl: paymentLink.short_url,
+      totalPrice: priced.totalPrice,
+      items: priced.canonicalItemsString,
+    });
+  } catch (error) {
+    console.error('Payment link creation error:', error);
+    res.status(500).json({ error: 'Could not create payment link.' });
   }
 });
 
