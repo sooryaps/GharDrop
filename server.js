@@ -55,6 +55,19 @@ app.use(cors());
 function requireOwnerAuth(req, res, next) {
   const token = req.headers['x-owner-token'];
   if (!isValidOwnerToken(token, process.env.OWNER_DASHBOARD_TOKEN)) {
+    // TEMPORARY DEBUG — remove once the mismatch is found. Deliberately
+    // logs only lengths and edge characters, never the full token values,
+    // so the real secret never ends up sitting in Railway's logs.
+    const expected = process.env.OWNER_DASHBOARD_TOKEN || '';
+    console.log('AUTH DEBUG:', {
+      receivedLength: token ? token.length : 0,
+      expectedLength: expected.length,
+      receivedFirst3: token ? token.slice(0, 3) : null,
+      receivedLast3: token ? token.slice(-3) : null,
+      expectedFirst3: expected.slice(0, 3),
+      expectedLast3: expected.slice(-3),
+      route: req.path,
+    });
     return res.status(401).json({ error: 'Unauthorized.' });
   }
   next();
