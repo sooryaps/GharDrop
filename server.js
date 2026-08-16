@@ -166,84 +166,82 @@ ${availableMenuNames.map((n) => `- ${n}`).join('\n')}
 }
 
 // ---- Chat route: talks to Gemini, using live menu + customer history ----
-app.post('/api/chat', async (req, res) => {
-  try {
-    const { message, phone } = req.body;
+// ---- Helper: generates a conversational reply using live menu, deals,
+// semantic search, and customer order history. Extracted so both the
+// public /api/chat route AND the WhatsApp webhook can call this directly
+// — previously the webhook self-called /api/chat over HTTP to localhost,
+// which added an unnecessary network hop and re-triggered the rate
+// limiter against itself. Direct function calls avoid both.
+async function generateChatReply(message, phone) {
+  const today = new Date().toISOString().split('T')[0];
 
-    const messageCheck = validateChatMessage(message);
-    if (!messageCheck.valid) {
-      return res.status(400).json({ error: messageCheck.error });
+  const { data: todaysMenu } = await supabase
+    .from('daily_menu')
+    .select('price_today, quantity_available, menu_items(name, tags, description)')
+    .eq('date', today);
+  const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
+
+  const queryEmbedding = await embedText(message);
+
+  let semanticMatches = '';
+  if (queryEmbedding) {
+    const { data: matches } = await supabase.rpc('match_menu_items', {
+      query_embedding: queryEmbedding,
+      match_threshold: 0.78,
+      match_count: 2,
+    });
+    if (matches && matches.length > 0) {
+      semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
     }
+  }
 
-    const today = new Date().toISOString().split('T')[0];
+  const { data: todaysDeals } = await supabase
+    .from('daily_deals')
+    .select('*')
+    .eq('date', today);
 
-    const { data: todaysMenu } = await supabase
-      .from('daily_menu')
-      .select('price_today, quantity_available, menu_items(name, tags, description)')
-      .eq('date', today);
-    const availableMenu = (todaysMenu || []).filter((item) => item.quantity_available > 0);
+  let historyText = 'No past order history available.';
+  if (phone) {
+    const { data: pastOrders } = await supabase
+      .from('orders')
+      .select('items, total_price, date')
+      .eq('customer_phone', phone)
+      .eq('status', 'completed')
+      .order('date', { ascending: false })
+      .limit(5);
 
-    const queryEmbedding = await embedText(message);
-
-    let semanticMatches = '';
-    if (queryEmbedding) {
-      const { data: matches } = await supabase.rpc('match_menu_items', {
-        query_embedding: queryEmbedding,
-        match_threshold: 0.78,
-        match_count: 2,
-      });
-      if (matches && matches.length > 0) {
-        semanticMatches = matches.map((m) => `- ${m.name} (similarity: ${m.similarity.toFixed(2)})`).join('\n');
-      }
+    if (pastOrders && pastOrders.length > 0) {
+      historyText = pastOrders
+        .map((o) => `- ${o.date}: ${o.items} (₹${o.total_price})`)
+        .join('\n');
     }
+  }
 
-    const { data: todaysDeals } = await supabase
-      .from('daily_deals')
-      .select('*')
-      .eq('date', today);
+  const menuText = (availableMenu || [])
+    .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})`)
+    .join('\n');
 
-    let historyText = 'No past order history available.';
-    if (phone) {
-      const { data: pastOrders } = await supabase
-        .from('orders')
-        .select('items, total_price, date')
-        .eq('customer_phone', phone)
-        .eq('status', 'completed')
-        .order('date', { ascending: false })
-        .limit(5);
+  const dealText = todaysDeals && todaysDeals.length > 0
+    ? todaysDeals
+        .filter((d) => d.remaining_count > 0)
+        .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''} — ${d.remaining_count} left`)
+        .join('\n') || 'No special deals available right now (sold out).'
+    : 'No special deal today.';
 
-      if (pastOrders && pastOrders.length > 0) {
-        historyText = pastOrders
-          .map((o) => `- ${o.date}: ${o.items} (₹${o.total_price})`)
-          .join('\n');
-      }
-    }
-
-    const menuText = (availableMenu || [])
-      .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})`)
-      .join('\n');
-
-    const dealText = todaysDeals && todaysDeals.length > 0
-      ? todaysDeals
-          .filter((d) => d.remaining_count > 0)
-          .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''} — ${d.remaining_count} left`)
-          .join('\n') || 'No special deals available right now (sold out).'
-      : 'No special deal today.';
-
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: message }] }],
-          systemInstruction: {
-            parts: [
-              {
-                text: `You are Ghardrop's ordering assistant. Only recommend dishes from today's actual menu below — never mention anything not listed. Keep replies short, 2-3 sentences, conversational.
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': process.env.GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: message }] }],
+        systemInstruction: {
+          parts: [
+            {
+              text: `You are Ghardrop's ordering assistant. Only recommend dishes from today's actual menu below — never mention anything not listed. Keep replies short, 2-3 sentences, conversational.
 
 Today's menu:
 ${menuText || 'No menu has been posted yet today — let the customer know to check back soon.'}
@@ -253,16 +251,28 @@ ${dealText}
 
 This customer's past orders (use this to personalize recommendations naturally, don't just list it back robotically):
 ${historyText}`,
-              },
-            ],
-          },
-          generationConfig: { maxOutputTokens: 1024 },
-        }),
-      }
-    );
+            },
+          ],
+        },
+        generationConfig: { maxOutputTokens: 1024 },
+      }),
+    }
+  );
 
-    const data = await response.json();
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sorry, no response.';
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sorry, no response.';
+}
+
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, phone } = req.body;
+
+    const messageCheck = validateChatMessage(message);
+    if (!messageCheck.valid) {
+      return res.status(400).json({ error: messageCheck.error });
+    }
+
+    const reply = await generateChatReply(message, phone);
     res.json({ reply });
   } catch (error) {
     console.error('Chat route error:', error);
@@ -284,6 +294,28 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// ---- Helper: sends a WhatsApp text message to a customer ----
+async function sendWhatsAppMessage(to, body) {
+  const result = await fetch(
+    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        text: { body },
+      }),
+    }
+  );
+  const data = await result.json();
+  console.log('WhatsApp send result:', JSON.stringify(data, null, 2));
+  return data;
+}
+
 // ---- WhatsApp incoming messages (Meta calls this every time, POST) ----
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200); // acknowledge immediately
@@ -293,36 +325,45 @@ app.post('/webhook', async (req, res) => {
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
-    if (message && message.type === 'text') {
-      const from = message.from;
-      const text = message.text.body;
-      console.log(`Message from ${from}: ${text}`);
+    if (!message || message.type !== 'text') return;
 
-      const chatResponse = await fetch(`http://localhost:${PORT}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, phone: from }),
-      });
-      const chatData = await chatResponse.json();
+    const from = message.from;
+    const text = message.text.body;
+    console.log(`Message from ${from}: ${text}`);
 
-      const sendResult = await fetch(
-        `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          },
-          body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            to: from,
-            text: { body: chatData.reply },
-          }),
-        }
-      );
-      const sendData = await sendResult.json();
-      console.log('WhatsApp send result:', JSON.stringify(sendData, null, 2));
+    const today = new Date().toISOString().split('T')[0];
+    const { data: todaysMenu } = await supabase
+      .from('daily_menu')
+      .select('quantity_available, menu_items(name)')
+      .eq('date', today);
+    const availableMenuNames = (todaysMenu || [])
+      .filter((item) => item.quantity_available > 0)
+      .map((item) => item.menu_items.name);
+
+    const intent = await detectOrderIntent(text, availableMenuNames);
+
+    if (intent.isOrder && intent.items.length > 0) {
+      const itemsString = formatItemsWithQuantity(intent.items);
+      const result = await createPaymentLinkForOrder({ items: itemsString, customerPhone: from });
+
+      if (result.ok) {
+        await sendWhatsAppMessage(
+          from,
+          `Got it! Your order: ${result.items} — ₹${result.totalPrice}.\n\nPay here to confirm: ${result.shortUrl}`
+        );
+      } else {
+        // Stock ran out, item unmatched, etc — tell the customer plainly
+        // rather than silently failing or falling back to generic chat,
+        // since they clearly tried to order something specific.
+        await sendWhatsAppMessage(from, result.error);
+      }
+      return;
     }
+
+    // Not a detected order (or a detected-but-unmatched attempt with no
+    // valid items) — fall back to normal conversational reply.
+    const reply = await generateChatReply(text, from);
+    await sendWhatsAppMessage(from, reply);
   } catch (error) {
     console.error('Webhook error:', error);
   }
@@ -511,6 +552,39 @@ app.post('/api/create-order', async (req, res) => {
   }
 });
 
+// ---- Helper: creates a real Razorpay Payment Link for an order, either
+// regular items or a specific deal. Extracted so the WhatsApp webhook can
+// call this directly (no HTTP self-call) when it detects order intent.
+async function createPaymentLinkForOrder({ items, customerPhone, dealId }) {
+  const today = new Date().toISOString().split('T')[0];
+
+  const priced = dealId
+    ? await resolveDealOrder(dealId, today)
+    : await validateAndPriceOrder(items, today);
+
+  if (!priced.ok) {
+    return priced; // { ok: false, status, error, outOfStock, notFound }
+  }
+
+  const paymentLink = await razorpay.paymentLink.create({
+    amount: Math.round(priced.totalPrice * 100), // paise
+    currency: 'INR',
+    description: priced.canonicalItemsString,
+    reference_id: `ghardrop_${Date.now()}`.slice(0, 40), // Razorpay caps reference_id at 40 chars
+    customer: { contact: customerPhone },
+    notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
+    notes: { items: priced.canonicalItemsString, customerPhone, dealId: priced.dealId ? String(priced.dealId) : '' },
+  });
+
+  return {
+    ok: true,
+    paymentLinkId: paymentLink.id,
+    shortUrl: paymentLink.short_url,
+    totalPrice: priced.totalPrice,
+    items: priced.canonicalItemsString,
+  };
+}
+
 // ---- Create a Razorpay Payment Link (WhatsApp flow) ----
 // Same validateAndPriceOrder gate as /api/create-order — a WhatsApp order
 // is priced and stock-checked exactly the same way a browser order is.
@@ -524,31 +598,17 @@ app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
       return res.status(400).json({ error: 'customerPhone is required.' });
     }
 
-    const today = new Date().toISOString().split('T')[0];
+    const result = await createPaymentLinkForOrder({ items, customerPhone, dealId });
 
-    const priced = dealId
-      ? await resolveDealOrder(dealId, today)
-      : await validateAndPriceOrder(items, today);
-
-    if (!priced.ok) {
-      return res.status(priced.status).json({ error: priced.error, outOfStock: priced.outOfStock, notFound: priced.notFound });
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error, outOfStock: result.outOfStock, notFound: result.notFound });
     }
 
-    const paymentLink = await razorpay.paymentLink.create({
-      amount: Math.round(priced.totalPrice * 100), // paise
-      currency: 'INR',
-      description: priced.canonicalItemsString,
-      reference_id: `ghardrop_${Date.now()}`.slice(0, 40), // Razorpay caps reference_id at 40 chars
-      customer: { contact: customerPhone },
-      notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
-      notes: { items: priced.canonicalItemsString, customerPhone, dealId: priced.dealId ? String(priced.dealId) : '' },
-    });
-
     res.json({
-      paymentLinkId: paymentLink.id,
-      shortUrl: paymentLink.short_url,
-      totalPrice: priced.totalPrice,
-      items: priced.canonicalItemsString,
+      paymentLinkId: result.paymentLinkId,
+      shortUrl: result.shortUrl,
+      totalPrice: result.totalPrice,
+      items: result.items,
     });
   } catch (error) {
     console.error('Payment link creation error:', error);
