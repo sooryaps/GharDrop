@@ -356,6 +356,58 @@ async function resolveOrderItems(requestedItems, today) {
   return resolved;
 }
 
+// ---- Helper: validates AND prices a DEAL order. Reuses resolveOrderItems
+// on the deal's stored components, so each component dish's real stock is
+// checked the exact same way a regular order would check it — a deal
+// can't bypass inventory limits. Price comes from the deal's bundle price
+// (daily_deals.price), not the sum of individual component prices. Also
+// checks the deal's OWN ticket capacity (separate from per-dish stock).
+async function resolveDealOrder(today) {
+  const { data: deal } = await supabase
+    .from('daily_deals')
+    .select('*')
+    .eq('date', today)
+    .single();
+
+  if (!deal) {
+    return { ok: false, status: 404, error: "No deal is available today." };
+  }
+  if (deal.remaining_count <= 0) {
+    return { ok: false, status: 409, error: "Sorry, today's deal is sold out." };
+  }
+  if (!Array.isArray(deal.components) || deal.components.length === 0) {
+    // Data integrity issue, not a customer error — log for investigation.
+    console.log(`DEAL MISCONFIGURED: deal id ${deal.id} for ${today} has no components.`);
+    return { ok: false, status: 500, error: "Today's deal isn't set up correctly. Please try individual items." };
+  }
+
+  const resolvedItems = await resolveOrderItems(deal.components, today);
+
+  const notFound = resolvedItems.filter((i) => !i.found).map((i) => i.requestedName);
+  const outOfStock = resolvedItems
+    .filter((i) => i.found && i.availableQty < i.quantity)
+    .map((i) => `${i.canonicalName} (wanted ${i.quantity}, ${i.availableQty} left)`);
+
+  if (notFound.length > 0 || outOfStock.length > 0) {
+    const problems = [];
+    if (outOfStock.length > 0) problems.push(`not enough stock: ${outOfStock.join(', ')}`);
+    if (notFound.length > 0) problems.push(`unavailable: ${notFound.join(', ')}`);
+    return {
+      ok: false,
+      status: 409,
+      error: `Sorry, today's deal can't be fulfilled right now (${problems.join('; ')}).`,
+      outOfStock,
+      notFound,
+    };
+  }
+
+  const canonicalItemsString = formatItemsWithQuantity(
+    resolvedItems.map((i) => ({ name: i.canonicalName, quantity: i.quantity }))
+  );
+
+  return { ok: true, totalPrice: deal.price, canonicalItemsString, isDealOrder: true };
+}
+
 // ---- Helper: validates AND prices an order from raw item names+quantities.
 // This is the single, shared security gate for EVERY way a customer can pay
 // (browser checkout, WhatsApp Payment Link, any future entry point) — they
@@ -417,10 +469,13 @@ async function validateAndPriceOrder(items, today) {
 // amount itself from real daily_menu.price_today values.
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { items, customerPhone } = req.body;
+    const { items, customerPhone, isDealOrder } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    const priced = await validateAndPriceOrder(items, today);
+    const priced = isDealOrder
+      ? await resolveDealOrder(today)
+      : await validateAndPriceOrder(items, today);
+
     if (!priced.ok) {
       return res.status(priced.status).json({ error: priced.error, outOfStock: priced.outOfStock, notFound: priced.notFound });
     }
@@ -429,7 +484,10 @@ app.post('/api/create-order', async (req, res) => {
       amount: Math.round(priced.totalPrice * 100), // paise
       currency: 'INR',
       receipt: `ghardrop_${Date.now()}`,
-      notes: { items: priced.canonicalItemsString, customerPhone },
+      // isDeal stored as a string — Razorpay notes values must be strings.
+      // The webhook checks this to know whether to also decrement the
+      // deal's own ticket counter, on top of the usual per-dish decrement.
+      notes: { items: priced.canonicalItemsString, customerPhone, isDeal: isDealOrder ? 'true' : 'false' },
     });
 
     res.json({
@@ -452,7 +510,7 @@ app.post('/api/create-order', async (req, res) => {
 // text message (Checkout.js's popup widget does not).
 app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
   try {
-    const { items, customerPhone } = req.body;
+    const { items, customerPhone, isDealOrder } = req.body;
 
     if (!customerPhone || typeof customerPhone !== 'string') {
       return res.status(400).json({ error: 'customerPhone is required.' });
@@ -460,7 +518,10 @@ app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
 
     const today = new Date().toISOString().split('T')[0];
 
-    const priced = await validateAndPriceOrder(items, today);
+    const priced = isDealOrder
+      ? await resolveDealOrder(today)
+      : await validateAndPriceOrder(items, today);
+
     if (!priced.ok) {
       return res.status(priced.status).json({ error: priced.error, outOfStock: priced.outOfStock, notFound: priced.notFound });
     }
@@ -472,7 +533,7 @@ app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
       reference_id: `ghardrop_${Date.now()}`.slice(0, 40), // Razorpay caps reference_id at 40 chars
       customer: { contact: customerPhone },
       notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
-      notes: { items: priced.canonicalItemsString, customerPhone },
+      notes: { items: priced.canonicalItemsString, customerPhone, isDeal: isDealOrder ? 'true' : 'false' },
     });
 
     res.json({
@@ -529,11 +590,12 @@ app.post('/razorpay-webhook', async (req, res) => {
   }
 
   const payment = req.body.payload.payment.entity;
-  const { items, customerPhone } = payment.notes;
+  const { items, customerPhone, isDeal } = payment.notes;
   const amountRupees = payment.amount / 100;
   const today = new Date().toISOString().split('T')[0];
+  const wasDealOrder = isDeal === 'true';
 
-  console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}`);
+  console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}${wasDealOrder ? ' (DEAL)' : ''}`);
 
   const { error: insertError } = await supabase.from('orders').insert({
     customer_phone: customerPhone,
@@ -581,6 +643,21 @@ app.post('/razorpay-webhook', async (req, res) => {
           // a real oversell that needs a human, not a silent failure.
           console.log(`OVERSOLD: ${dishName} x${quantity} — payment captured but insufficient stock at decrement time. Manual review needed for order from ${customerPhone}.`);
         }
+      }
+    }
+
+    if (wasDealOrder) {
+      // Atomic, same pattern as decrement_ticket — refuses to go below 0
+      // even under concurrent deal payments. This is IN ADDITION TO the
+      // per-dish decrement above, which already covers the deal's
+      // component dishes correctly since `items` contains them.
+      const { data: dealDecremented, error: dealTicketError } = await supabase.rpc('decrement_deal_ticket', {
+        row_date: today,
+      });
+      if (dealTicketError) {
+        console.log('DEAL TICKET DECREMENT FAILED:', dealTicketError.message);
+      } else if (!dealDecremented) {
+        console.log(`DEAL OVERSOLD: payment captured but deal was already at 0 remaining. Manual review needed for order from ${customerPhone}.`);
       }
     }
 
