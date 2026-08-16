@@ -1003,6 +1003,49 @@ app.get('/api/menu-items', requireOwnerAuth, async (req, res) => {
   res.json(data);
 });
 
+// ---- Returns yesterday's saved menu + deals, so the menu page can
+// pre-fill today's form as a starting point. Does NOT save anything —
+// purely read-only; the owner still reviews and hits Save herself.
+// Dishes that have since been archived are silently skipped rather than
+// breaking the copy (they just won't be checkable anyway). ----
+app.get('/api/daily-menu/yesterday', requireOwnerAuth, async (req, res) => {
+  try {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const { data: yesterdaysMenu } = await supabase
+      .from('daily_menu')
+      .select('price_today, quantity_available, menu_items!inner(id, name, active)')
+      .eq('date', yesterday);
+
+    const items = (yesterdaysMenu || [])
+      .filter((row) => row.menu_items.active) // skip archived dishes
+      .map((row) => ({
+        menuItemId: row.menu_items.id,
+        name: row.menu_items.name,
+        price: row.price_today,
+        quantity: row.quantity_available,
+      }));
+
+    const { data: yesterdaysDeals } = await supabase
+      .from('daily_deals')
+      .select('*')
+      .eq('date', yesterday);
+
+    const deals = (yesterdaysDeals || []).map((deal) => ({
+      title: deal.title,
+      components: deal.components,
+      price: deal.price,
+      originalPrice: deal.original_price,
+      capacity: deal.total_capacity,
+    }));
+
+    res.json({ date: yesterday, items, deals });
+  } catch (error) {
+    console.error('Copy-yesterday route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // ---- Powers the owner dashboard: recent orders, revenue, best-sellers, today's tickets ----
 app.get('/api/dashboard', requireOwnerAuth, async (req, res) => {
   try {
