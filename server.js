@@ -197,11 +197,10 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    const { data: todaysDeal } = await supabase
+    const { data: todaysDeals } = await supabase
       .from('daily_deals')
       .select('*')
-      .eq('date', today)
-      .single();
+      .eq('date', today);
 
     let historyText = 'No past order history available.';
     if (phone) {
@@ -224,8 +223,11 @@ app.post('/api/chat', async (req, res) => {
       .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})`)
       .join('\n');
 
-    const dealText = todaysDeal
-      ? `Today's deal: ${todaysDeal.title} — ${todaysDeal.items} for ₹${todaysDeal.price} (normally ₹${todaysDeal.original_price})`
+    const dealText = todaysDeals && todaysDeals.length > 0
+      ? todaysDeals
+          .filter((d) => d.remaining_count > 0)
+          .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''} — ${d.remaining_count} left`)
+          .join('\n') || 'No special deals available right now (sold out).'
       : 'No special deal today.';
 
     const response = await fetch(
@@ -356,29 +358,35 @@ async function resolveOrderItems(requestedItems, today) {
   return resolved;
 }
 
-// ---- Helper: validates AND prices a DEAL order. Reuses resolveOrderItems
-// on the deal's stored components, so each component dish's real stock is
-// checked the exact same way a regular order would check it — a deal
-// can't bypass inventory limits. Price comes from the deal's bundle price
-// (daily_deals.price), not the sum of individual component prices. Also
-// checks the deal's OWN ticket capacity (separate from per-dish stock).
-async function resolveDealOrder(today) {
+// ---- Helper: validates AND prices a DEAL order, for a SPECIFIC deal by
+// ID — necessary now that multiple deals can exist on the same day.
+// Reuses resolveOrderItems on the deal's stored components, so each
+// component dish's real stock is checked the exact same way a regular
+// order would check it — a deal can't bypass inventory limits. Price
+// comes from the deal's bundle price (daily_deals.price), not the sum of
+// individual component prices. Also checks the deal's OWN ticket capacity.
+async function resolveDealOrder(dealId, today) {
   const { data: deal } = await supabase
     .from('daily_deals')
     .select('*')
-    .eq('date', today)
+    .eq('id', dealId)
     .single();
 
   if (!deal) {
-    return { ok: false, status: 404, error: "No deal is available today." };
+    return { ok: false, status: 404, error: 'That deal could not be found.' };
+  }
+  if (deal.date !== today) {
+    // Prevents paying against a stale deal ID from a previous day, e.g. a
+    // link/reference held onto after the deal expired.
+    return { ok: false, status: 410, error: 'That deal is no longer available (expired).' };
   }
   if (deal.remaining_count <= 0) {
-    return { ok: false, status: 409, error: "Sorry, today's deal is sold out." };
+    return { ok: false, status: 409, error: `Sorry, "${deal.title}" is sold out.` };
   }
   if (!Array.isArray(deal.components) || deal.components.length === 0) {
     // Data integrity issue, not a customer error — log for investigation.
     console.log(`DEAL MISCONFIGURED: deal id ${deal.id} for ${today} has no components.`);
-    return { ok: false, status: 500, error: "Today's deal isn't set up correctly. Please try individual items." };
+    return { ok: false, status: 500, error: "That deal isn't set up correctly. Please try individual items." };
   }
 
   const resolvedItems = await resolveOrderItems(deal.components, today);
@@ -395,7 +403,7 @@ async function resolveDealOrder(today) {
     return {
       ok: false,
       status: 409,
-      error: `Sorry, today's deal can't be fulfilled right now (${problems.join('; ')}).`,
+      error: `Sorry, "${deal.title}" can't be fulfilled right now (${problems.join('; ')}).`,
       outOfStock,
       notFound,
     };
@@ -405,7 +413,7 @@ async function resolveDealOrder(today) {
     resolvedItems.map((i) => ({ name: i.canonicalName, quantity: i.quantity }))
   );
 
-  return { ok: true, totalPrice: deal.price, canonicalItemsString, isDealOrder: true };
+  return { ok: true, totalPrice: deal.price, canonicalItemsString, isDealOrder: true, dealId: deal.id };
 }
 
 // ---- Helper: validates AND prices an order from raw item names+quantities.
@@ -469,11 +477,11 @@ async function validateAndPriceOrder(items, today) {
 // amount itself from real daily_menu.price_today values.
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { items, customerPhone, isDealOrder } = req.body;
+    const { items, customerPhone, dealId } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
-    const priced = isDealOrder
-      ? await resolveDealOrder(today)
+    const priced = dealId
+      ? await resolveDealOrder(dealId, today)
       : await validateAndPriceOrder(items, today);
 
     if (!priced.ok) {
@@ -484,10 +492,10 @@ app.post('/api/create-order', async (req, res) => {
       amount: Math.round(priced.totalPrice * 100), // paise
       currency: 'INR',
       receipt: `ghardrop_${Date.now()}`,
-      // isDeal stored as a string — Razorpay notes values must be strings.
-      // The webhook checks this to know whether to also decrement the
-      // deal's own ticket counter, on top of the usual per-dish decrement.
-      notes: { items: priced.canonicalItemsString, customerPhone, isDeal: isDealOrder ? 'true' : 'false' },
+      // Razorpay notes values must be strings. Storing the actual dealId
+      // (not just true/false) is what lets the webhook decrement the
+      // CORRECT deal now that multiple deals can exist on the same day.
+      notes: { items: priced.canonicalItemsString, customerPhone, dealId: priced.dealId ? String(priced.dealId) : '' },
     });
 
     res.json({
@@ -510,7 +518,7 @@ app.post('/api/create-order', async (req, res) => {
 // text message (Checkout.js's popup widget does not).
 app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
   try {
-    const { items, customerPhone, isDealOrder } = req.body;
+    const { items, customerPhone, dealId } = req.body;
 
     if (!customerPhone || typeof customerPhone !== 'string') {
       return res.status(400).json({ error: 'customerPhone is required.' });
@@ -518,8 +526,8 @@ app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
 
     const today = new Date().toISOString().split('T')[0];
 
-    const priced = isDealOrder
-      ? await resolveDealOrder(today)
+    const priced = dealId
+      ? await resolveDealOrder(dealId, today)
       : await validateAndPriceOrder(items, today);
 
     if (!priced.ok) {
@@ -533,7 +541,7 @@ app.post('/api/create-payment-link', requireOwnerAuth, async (req, res) => {
       reference_id: `ghardrop_${Date.now()}`.slice(0, 40), // Razorpay caps reference_id at 40 chars
       customer: { contact: customerPhone },
       notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
-      notes: { items: priced.canonicalItemsString, customerPhone, isDeal: isDealOrder ? 'true' : 'false' },
+      notes: { items: priced.canonicalItemsString, customerPhone, dealId: priced.dealId ? String(priced.dealId) : '' },
     });
 
     res.json({
@@ -590,12 +598,12 @@ app.post('/razorpay-webhook', async (req, res) => {
   }
 
   const payment = req.body.payload.payment.entity;
-  const { items, customerPhone, isDeal } = payment.notes;
+  const { items, customerPhone, dealId } = payment.notes;
   const amountRupees = payment.amount / 100;
   const today = new Date().toISOString().split('T')[0];
-  const wasDealOrder = isDeal === 'true';
+  const wasDealOrder = !!dealId;
 
-  console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}${wasDealOrder ? ' (DEAL)' : ''}`);
+  console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}${wasDealOrder ? ` (DEAL id ${dealId})` : ''}`);
 
   const { error: insertError } = await supabase.from('orders').insert({
     customer_phone: customerPhone,
@@ -650,14 +658,16 @@ app.post('/razorpay-webhook', async (req, res) => {
       // Atomic, same pattern as decrement_ticket — refuses to go below 0
       // even under concurrent deal payments. This is IN ADDITION TO the
       // per-dish decrement above, which already covers the deal's
-      // component dishes correctly since `items` contains them.
+      // component dishes correctly since `items` contains them. Keyed by
+      // the specific dealId (not date) now that multiple deals per day
+      // are supported.
       const { data: dealDecremented, error: dealTicketError } = await supabase.rpc('decrement_deal_ticket', {
-        row_date: today,
+        row_id: Number(dealId),
       });
       if (dealTicketError) {
-        console.log('DEAL TICKET DECREMENT FAILED:', dealTicketError.message);
+        console.log(`DEAL TICKET DECREMENT FAILED for deal ${dealId}:`, dealTicketError.message);
       } else if (!dealDecremented) {
-        console.log(`DEAL OVERSOLD: payment captured but deal was already at 0 remaining. Manual review needed for order from ${customerPhone}.`);
+        console.log(`DEAL OVERSOLD: deal ${dealId} — payment captured but deal was already at 0 remaining. Manual review needed for order from ${customerPhone}.`);
       }
     }
 
@@ -688,15 +698,7 @@ app.post('/razorpay-webhook', async (req, res) => {
 // ---- Mom uses this each day to set what's being cooked, prices, and today's deal ----
 app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
   try {
-    const {
-      items,
-      dealTitle,
-      dealComponents,
-      dealPrice,
-      dealOriginalPrice,
-      dealCapacity,
-      ticketCap,
-    } = req.body;
+    const { items, deals, ticketCap } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -724,39 +726,52 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
       return res.status(400).json({ error: `Invalid Total Tickets Today: ${capacityCheck.error}` });
     }
 
-    // If a deal is being set up, validate its capacity and components
-    // BEFORE writing anything — same fail-fast-and-whole principle as the
-    // quantity check above. A deal's components must reference dishes
-    // that are actually checked/being sold today; you can't build a deal
-    // around a dish that isn't live.
-    let validatedDealCapacity = null;
-    if (dealTitle) {
-      const dealCapacityToUse = dealCapacity === undefined || dealCapacity === null ? 25 : dealCapacity;
+    // `deals` is now an array — 0, 1, or many deals can exist on the same
+    // day. Each is validated independently, same fail-fast-and-whole
+    // principle as the quantity check above: if ANY deal is invalid, the
+    // whole save is rejected before anything is written, rather than
+    // silently saving some deals and dropping bad ones.
+    const dealsToValidate = Array.isArray(deals) ? deals : [];
+    const todaysCheckedNames = items.map((i) => i.name).filter(Boolean);
+    const validatedDeals = [];
+
+    for (const deal of dealsToValidate) {
+      if (!deal.title || typeof deal.title !== 'string' || deal.title.trim().length === 0) {
+        return res.status(400).json({ error: 'Every deal needs a title.' });
+      }
+
+      const dealCapacityToUse = deal.capacity === undefined || deal.capacity === null ? 25 : deal.capacity;
       const dealCapacityCheck = validateTicketCapacity(dealCapacityToUse);
       if (!dealCapacityCheck.valid) {
-        return res.status(400).json({ error: `Invalid deal capacity: ${dealCapacityCheck.error}` });
+        return res.status(400).json({ error: `Invalid capacity for deal "${deal.title}": ${dealCapacityCheck.error}` });
       }
-      validatedDealCapacity = dealCapacityToUse;
 
-      const componentsCheck = validateDealComponents(dealComponents);
+      const componentsCheck = validateDealComponents(deal.components);
       if (!componentsCheck.valid) {
-        return res.status(400).json({ error: componentsCheck.error });
+        return res.status(400).json({ error: `Deal "${deal.title}": ${componentsCheck.error}` });
       }
 
-      const todaysCheckedNames = items.map((i) => i.name).filter(Boolean);
-      const unknownComponents = dealComponents
+      const unknownComponents = deal.components
         .map((c) => c.name)
         .filter((name) => !matchDishName(name, todaysCheckedNames));
       if (unknownComponents.length > 0) {
         return res.status(400).json({
-          error: `Deal components must be dishes checked in today's menu. Not found: ${unknownComponents.join(', ')}`,
+          error: `Deal "${deal.title}" components must be dishes checked in today's menu. Not found: ${unknownComponents.join(', ')}`,
         });
       }
 
-      const priceCheck = validateOrderAmount(dealPrice);
+      const priceCheck = validateOrderAmount(deal.price);
       if (!priceCheck.valid) {
-        return res.status(400).json({ error: `Invalid deal price: ${priceCheck.error}` });
+        return res.status(400).json({ error: `Invalid price for deal "${deal.title}": ${priceCheck.error}` });
       }
+
+      validatedDeals.push({
+        title: deal.title.trim(),
+        components: deal.components,
+        price: deal.price,
+        originalPrice: deal.originalPrice || null,
+        capacity: dealCapacityToUse,
+      });
     }
 
     const dailyMenuRows = items.map((item) => ({
@@ -773,25 +788,29 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
       return res.status(500).json({ error: 'Could not save menu.' });
     }
 
+    // Delete-then-reinsert-all is the same idempotent pattern used for
+    // daily_menu — re-saving the page always reflects exactly what's in
+    // the form, clearing any deals removed since the last save. Now
+    // inserts however many deals were validated above (0, 1, or many).
     await supabase.from('daily_deals').delete().eq('date', today);
-    if (dealTitle) {
-      // items (display string) is derived from the validated, structured
-      // components — never free text — so what's shown always matches
-      // what checkout will actually decrement.
-      const dealItemsDisplay = formatItemsWithQuantity(dealComponents);
-      const { error: dealError } = await supabase.from('daily_deals').insert({
+    if (validatedDeals.length > 0) {
+      const dealRows = validatedDeals.map((deal) => ({
         date: today,
-        title: dealTitle,
-        items: dealItemsDisplay,
-        components: dealComponents,
-        price: dealPrice,
-        original_price: dealOriginalPrice || null,
-        total_capacity: validatedDealCapacity,
-        remaining_count: validatedDealCapacity,
-      });
+        title: deal.title,
+        // items (display string) is derived from the validated, structured
+        // components — never free text — so what's shown always matches
+        // what checkout will actually decrement.
+        items: formatItemsWithQuantity(deal.components),
+        components: deal.components,
+        price: deal.price,
+        original_price: deal.originalPrice,
+        total_capacity: deal.capacity,
+        remaining_count: deal.capacity,
+      }));
+      const { error: dealError } = await supabase.from('daily_deals').insert(dealRows);
       if (dealError) {
-        console.log('DAILY DEAL INSERT FAILED:', dealError.message);
-        return res.status(500).json({ error: 'Menu saved, but could not save the deal.' });
+        console.log('DAILY DEALS INSERT FAILED:', dealError.message);
+        return res.status(500).json({ error: 'Menu saved, but could not save the deal(s).' });
       }
     }
 
@@ -803,6 +822,44 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
     res.json({ success: true, message: `Today's menu saved with ${items.length} items.` });
   } catch (error) {
     console.error('Daily menu route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---- Quick "Sold Out" toggle — instantly sets one dish's remaining
+// stock to 0 for today, WITHOUT requiring the whole menu form to be
+// resubmitted. This is for the real moment something runs out mid-day —
+// a single tap, not reopening the full menu page. Also supports
+// "un-sold-out" (restoring a quantity) via the same route, so a
+// misclick is recoverable. ----
+app.patch('/api/daily-menu/:menuItemId/stock', requireOwnerAuth, async (req, res) => {
+  try {
+    const { menuItemId } = req.params;
+    const { quantity_available } = req.body;
+    const today = new Date().toISOString().split('T')[0];
+
+    const quantityCheck = validateQuantity(quantity_available);
+    if (!quantityCheck.valid) {
+      return res.status(400).json({ error: quantityCheck.error });
+    }
+
+    const { data, error } = await supabase
+      .from('daily_menu')
+      .update({ quantity_available })
+      .eq('date', today)
+      .eq('menu_item_id', menuItemId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(error ? 500 : 404).json({
+        error: error ? 'Could not update stock.' : "This dish isn't part of today's live menu yet — save the menu first.",
+      });
+    }
+
+    res.json({ success: true, quantity_available: data.quantity_available });
+  } catch (error) {
+    console.error('Quick stock update route error:', error);
     res.status(500).json({ error: 'Something went wrong.' });
   }
 });
@@ -845,9 +902,103 @@ app.post('/api/menu-items', requireOwnerAuth, async (req, res) => {
   }
 });
 
-// ---- Fetch the master list of all possible dishes, for the menu upload page ----
+// ---- Mom uses this to fix a spelling mistake or update a dish's price/
+// description on the master list, without deleting and recreating it
+// (which would also lose its history/embedding). ----
+app.patch('/api/menu-items/:id', requireOwnerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, base_price, description, tags, active } = req.body;
+
+    const updates = {};
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'Dish name cannot be empty.' });
+      }
+      updates.name = name.trim();
+    }
+    if (base_price !== undefined) {
+      const priceCheck = validateOrderAmount(base_price);
+      if (!priceCheck.valid) {
+        return res.status(400).json({ error: `Invalid price: ${priceCheck.error}` });
+      }
+      updates.base_price = base_price;
+    }
+    if (description !== undefined) updates.description = description || null;
+    if (tags !== undefined) updates.tags = tags || null;
+    if (active !== undefined) {
+      if (typeof active !== 'boolean') {
+        return res.status(400).json({ error: '"active" must be true or false.' });
+      }
+      updates.active = active;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No changes provided.' });
+    }
+
+    const { data, error } = await supabase
+      .from('menu_items')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error || !data) {
+      console.log('MENU ITEM UPDATE FAILED:', error ? error.message : 'no matching row');
+      return res.status(error ? 500 : 404).json({ error: error ? 'Could not update dish.' : 'Dish not found.' });
+    }
+
+    // NOTE: if the name changed, this dish's embedding (used for semantic
+    // search in /api/chat) is now stale — it still reflects the OLD name.
+    // Not auto-regenerated here to avoid an extra Gemini call on every
+    // edit; re-run /api/generate-embeddings after a name/description
+    // change if semantic search accuracy matters for this dish.
+    res.json({ success: true, dish: data });
+  } catch (error) {
+    console.error('Edit menu item route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---- "Delete" a dish from the master list — actually a SOFT delete
+// (active = false), matching how real catalogs handle this (Shopify
+// "archived", Amazon "inactive"). A hard delete risks breaking foreign-key
+// references from daily_menu, and orders already store item names as
+// plain-text snapshots rather than live references, so archiving loses
+// nothing historically while still removing the dish from view going
+// forward. ----
+app.delete('/api/menu-items/:id', requireOwnerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('menu_items')
+      .update({ active: false })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error || !data) {
+      console.log('MENU ITEM ARCHIVE FAILED:', error ? error.message : 'no matching row');
+      return res.status(error ? 500 : 404).json({ error: error ? 'Could not archive dish.' : 'Dish not found.' });
+    }
+    res.json({ success: true, dish: data });
+  } catch (error) {
+    console.error('Archive menu item route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---- Fetch the master list of dishes, for the menu upload page.
+// Only ACTIVE dishes by default — archived ones stay out of the "check
+// what to cook today" list without being deleted. Pass
+// ?includeArchived=true to see everything (e.g. for a future restore UI). ----
 app.get('/api/menu-items', requireOwnerAuth, async (req, res) => {
-  const { data, error } = await supabase.from('menu_items').select('*');
+  let query = supabase.from('menu_items').select('*');
+  if (req.query.includeArchived !== 'true') {
+    query = query.eq('active', true);
+  }
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
