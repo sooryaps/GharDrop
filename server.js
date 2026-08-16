@@ -1051,12 +1051,13 @@ app.get('/api/daily-menu/yesterday', requireOwnerAuth, async (req, res) => {
 // no best-sellers, no CRM data — just what needs cooking right now. ----
 app.get('/api/kitchen-orders', requireOwnerAuth, async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
-
+    // NOT filtered by today's date — a pending/preparing/ready order from
+    // yesterday still genuinely needs attention. Scoping this to "today
+    // only" would make an old unfinished order silently disappear at
+    // midnight even though nothing about it was resolved.
     const { data: orders, error } = await supabase
       .from('orders')
       .select('id, items, kitchen_status, created_at, customer_phone')
-      .eq('date', today)
       .in('kitchen_status', ['pending', 'preparing', 'ready'])
       .order('created_at', { ascending: true }); // oldest first — cook in order received
 
