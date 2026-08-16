@@ -4,6 +4,8 @@ const {
   isDishAvailable,
   validateQuantity,
   validateOrderQuantity,
+  validateTicketCapacity,
+  validateDealComponents,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,
@@ -165,6 +167,69 @@ describe('matchDishName', () => {
     expect(matchDishName('', menu)).toBeNull();
     expect(matchDishName(null, menu)).toBeNull();
     expect(matchDishName('Kori Gassi', [])).toBeNull();
+  });
+});
+
+// ---- validateTicketCapacity ----
+describe('validateTicketCapacity', () => {
+  test('rejects a negative capacity (the ticketCap loophole this closes)', () => {
+    expect(validateTicketCapacity(-5).valid).toBe(false);
+  });
+
+  test('rejects zero', () => {
+    expect(validateTicketCapacity(0).valid).toBe(false);
+  });
+
+  test('rejects a non-integer', () => {
+    expect(validateTicketCapacity(12.5).valid).toBe(false);
+  });
+
+  test('rejects an unrealistically high value', () => {
+    expect(validateTicketCapacity(9999).valid).toBe(false);
+  });
+
+  test('rejects a non-number type', () => {
+    expect(validateTicketCapacity('25').valid).toBe(false);
+  });
+
+  test('accepts a normal capacity', () => {
+    expect(validateTicketCapacity(25).valid).toBe(true);
+  });
+});
+
+// ---- validateDealComponents ----
+describe('validateDealComponents', () => {
+  test('accepts a valid single-component deal', () => {
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 1 }]).valid).toBe(true);
+  });
+
+  test('accepts a valid multi-component deal', () => {
+    const components = [
+      { name: 'Neer Dosa (4pc)', quantity: 1 },
+      { name: 'Boiled Red Rice', quantity: 1 },
+    ];
+    expect(validateDealComponents(components).valid).toBe(true);
+  });
+
+  test('rejects an empty components array', () => {
+    expect(validateDealComponents([]).valid).toBe(false);
+  });
+
+  test('rejects non-array input', () => {
+    expect(validateDealComponents(null).valid).toBe(false);
+    expect(validateDealComponents('Neer Dosa').valid).toBe(false);
+  });
+
+  test('rejects a component missing a name', () => {
+    expect(validateDealComponents([{ quantity: 1 }]).valid).toBe(false);
+  });
+
+  test('rejects a component with an invalid (zero) quantity', () => {
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 0 }]).valid).toBe(false);
+  });
+
+  test('rejects a component with a negative quantity', () => {
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: -1 }]).valid).toBe(false);
   });
 });
 

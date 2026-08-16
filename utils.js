@@ -26,6 +26,50 @@ function validateChatMessage(message) {
   }
   return { valid: true };
 }
+/**
+ * Validates a ticket/deal capacity value (e.g. "Total Tickets Today",
+ * or a deal's own capacity like "25 Sunday Thalis"). Previously ticketCap
+ * had NO validation at all (`ticketCap || 25` lets a negative number
+ * through unchanged, since it's truthy) — this closes that gap and is
+ * reused for deal capacity so both share one rule.
+ */
+function validateTicketCapacity(value) {
+  if (typeof value !== 'number' || Number.isNaN(value) || !Number.isInteger(value)) {
+    return { valid: false, error: 'Capacity must be a whole number.' };
+  }
+  if (value < 1) {
+    return { valid: false, error: 'Capacity must be at least 1.' };
+  }
+  if (value > 500) {
+    return { valid: false, error: 'Capacity seems unrealistically high — please double check.' };
+  }
+  return { valid: true };
+}
+
+/**
+ * Validates a deal's structured component list — the real dishes+quantities
+ * that make up the deal (e.g. Sunday Thali = 1x Neer Dosa + 1x Rice).
+ * Requires at least one component, and every component to have a real
+ * name and a valid order-style quantity (>=1). This structure is what
+ * downstream checkout logic uses to decrement real dish stock alongside
+ * the deal's own ticket count — free-text deal descriptions can't safely
+ * drive an atomic stock decrement, so this is the actual source of truth.
+ */
+function validateDealComponents(components) {
+  if (!Array.isArray(components) || components.length === 0) {
+    return { valid: false, error: 'A deal needs at least one component dish.' };
+  }
+  for (const component of components) {
+    if (!component || typeof component.name !== 'string' || component.name.trim().length === 0) {
+      return { valid: false, error: 'Every deal component needs a dish name.' };
+    }
+    const qtyCheck = validateOrderQuantity(component.quantity);
+    if (!qtyCheck.valid) {
+      return { valid: false, error: `Invalid quantity for deal component "${component.name}": ${qtyCheck.error}` };
+    }
+  }
+  return { valid: true };
+}
 function isDishAvailable(quantityAvailable) {
   return quantityAvailable > 0;
 }
@@ -313,6 +357,8 @@ module.exports = {
   isDishAvailable,
   validateQuantity,
   validateOrderQuantity,
+  validateTicketCapacity,
+  validateDealComponents,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,

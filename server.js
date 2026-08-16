@@ -14,6 +14,8 @@ const {
   validateChatMessage,
   validateQuantity,
   validateOrderQuantity,
+  validateTicketCapacity,
+  validateDealComponents,
   validateRating,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
@@ -609,7 +611,15 @@ app.post('/razorpay-webhook', async (req, res) => {
 // ---- Mom uses this each day to set what's being cooked, prices, and today's deal ----
 app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
   try {
-    const { items, dealTitle, dealItems, dealPrice, dealOriginalPrice, ticketCap } = req.body;
+    const {
+      items,
+      dealTitle,
+      dealComponents,
+      dealPrice,
+      dealOriginalPrice,
+      dealCapacity,
+      ticketCap,
+    } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -623,8 +633,52 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
       const quantityCheck = validateQuantity(item.quantity);
       if (!quantityCheck.valid) {
         return res.status(400).json({
-          error: `Invalid quantity for item "${item.menuItemId}": ${quantityCheck.error}`,
+          error: `Invalid quantity for item "${item.name || item.menuItemId}": ${quantityCheck.error}`,
         });
+      }
+    }
+
+    // Validate the daily order-capacity ticket count. Previously
+    // `ticketCap || 25` let a negative number through unchanged (negative
+    // numbers are truthy in JS) — this closes that gap.
+    const capacityToUse = ticketCap === undefined || ticketCap === null ? 25 : ticketCap;
+    const capacityCheck = validateTicketCapacity(capacityToUse);
+    if (!capacityCheck.valid) {
+      return res.status(400).json({ error: `Invalid Total Tickets Today: ${capacityCheck.error}` });
+    }
+
+    // If a deal is being set up, validate its capacity and components
+    // BEFORE writing anything — same fail-fast-and-whole principle as the
+    // quantity check above. A deal's components must reference dishes
+    // that are actually checked/being sold today; you can't build a deal
+    // around a dish that isn't live.
+    let validatedDealCapacity = null;
+    if (dealTitle) {
+      const dealCapacityToUse = dealCapacity === undefined || dealCapacity === null ? 25 : dealCapacity;
+      const dealCapacityCheck = validateTicketCapacity(dealCapacityToUse);
+      if (!dealCapacityCheck.valid) {
+        return res.status(400).json({ error: `Invalid deal capacity: ${dealCapacityCheck.error}` });
+      }
+      validatedDealCapacity = dealCapacityToUse;
+
+      const componentsCheck = validateDealComponents(dealComponents);
+      if (!componentsCheck.valid) {
+        return res.status(400).json({ error: componentsCheck.error });
+      }
+
+      const todaysCheckedNames = items.map((i) => i.name).filter(Boolean);
+      const unknownComponents = dealComponents
+        .map((c) => c.name)
+        .filter((name) => !matchDishName(name, todaysCheckedNames));
+      if (unknownComponents.length > 0) {
+        return res.status(400).json({
+          error: `Deal components must be dishes checked in today's menu. Not found: ${unknownComponents.join(', ')}`,
+        });
+      }
+
+      const priceCheck = validateOrderAmount(dealPrice);
+      if (!priceCheck.valid) {
+        return res.status(400).json({ error: `Invalid deal price: ${priceCheck.error}` });
       }
     }
 
@@ -642,26 +696,74 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
       return res.status(500).json({ error: 'Could not save menu.' });
     }
 
+    await supabase.from('daily_deals').delete().eq('date', today);
     if (dealTitle) {
-      await supabase.from('daily_deals').delete().eq('date', today);
+      // items (display string) is derived from the validated, structured
+      // components — never free text — so what's shown always matches
+      // what checkout will actually decrement.
+      const dealItemsDisplay = formatItemsWithQuantity(dealComponents);
       const { error: dealError } = await supabase.from('daily_deals').insert({
         date: today,
         title: dealTitle,
-        items: dealItems,
+        items: dealItemsDisplay,
+        components: dealComponents,
         price: dealPrice,
-        original_price: dealOriginalPrice,
+        original_price: dealOriginalPrice || null,
+        total_capacity: validatedDealCapacity,
+        remaining_count: validatedDealCapacity,
       });
-      if (dealError) console.log('DAILY DEAL INSERT FAILED:', dealError.message);
+      if (dealError) {
+        console.log('DAILY DEAL INSERT FAILED:', dealError.message);
+        return res.status(500).json({ error: 'Menu saved, but could not save the deal.' });
+      }
     }
 
     const { error: ticketError } = await supabase
       .from('tickets')
-      .upsert({ date: today, total_capacity: ticketCap || 25, remaining_count: ticketCap || 25 });
+      .upsert({ date: today, total_capacity: capacityToUse, remaining_count: capacityToUse });
     if (ticketError) console.log('TICKET UPSERT FAILED:', ticketError.message);
 
     res.json({ success: true, message: `Today's menu saved with ${items.length} items.` });
   } catch (error) {
     console.error('Daily menu route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---- Mom uses this to add a brand new dish to the master list (not tied
+// to any specific day — it just makes the dish available to check next
+// time she builds today's live menu). ----
+app.post('/api/menu-items', requireOwnerAuth, async (req, res) => {
+  try {
+    const { name, base_price, description, tags } = req.body;
+
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Dish name is required.' });
+    }
+    const priceCheck = validateOrderAmount(base_price);
+    if (!priceCheck.valid) {
+      return res.status(400).json({ error: `Invalid price: ${priceCheck.error}` });
+    }
+
+    const { data, error } = await supabase
+      .from('menu_items')
+      .insert({
+        name: name.trim(),
+        base_price,
+        description: description || null,
+        tags: tags || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.log('MENU ITEM INSERT FAILED:', error.message);
+      return res.status(500).json({ error: 'Could not add dish.' });
+    }
+
+    res.json({ success: true, dish: data });
+  } catch (error) {
+    console.error('Add menu item route error:', error);
     res.status(500).json({ error: 'Something went wrong.' });
   }
 });
