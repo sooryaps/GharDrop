@@ -12,6 +12,7 @@ const {
   parseItemsWithQuantity,
   formatItemsWithQuantity,
   parseOrderIntentResponse,
+  parseComplaintIntentResponse,
   matchDishName,
   validateStatusTransition,
   isValidOwnerToken,
@@ -69,6 +70,51 @@ describe('isDishAvailable', () => {
 
   test('available above 0', () => {
     expect(isDishAvailable(5)).toBe(true);
+  });
+});
+
+// ---- parseComplaintIntentResponse ----
+describe('parseComplaintIntentResponse', () => {
+  test('parses a clean detected complaint', () => {
+    const raw = '{"isComplaint": true, "summary": "Order arrived cold and 30 minutes late"}';
+    const result = parseComplaintIntentResponse(raw);
+    expect(result.valid).toBe(true);
+    expect(result.data.isComplaint).toBe(true);
+    expect(result.data.summary).toBe('Order arrived cold and 30 minutes late');
+  });
+
+  test('parses a clean non-complaint', () => {
+    const result = parseComplaintIntentResponse('{"isComplaint": false}');
+    expect(result.valid).toBe(true);
+    expect(result.data.isComplaint).toBe(false);
+  });
+
+  test('strips markdown code fences', () => {
+    const raw = '```json\n{"isComplaint": true, "summary": "Wrong item delivered"}\n```';
+    const result = parseComplaintIntentResponse(raw);
+    expect(result.valid).toBe(true);
+    expect(result.data.summary).toBe('Wrong item delivered');
+  });
+
+  test('rejects malformed JSON instead of throwing', () => {
+    expect(parseComplaintIntentResponse('not json').valid).toBe(false);
+  });
+
+  test('rejects a response missing isComplaint', () => {
+    expect(parseComplaintIntentResponse('{"summary": "test"}').valid).toBe(false);
+  });
+
+  test('rejects isComplaint: true with a missing summary', () => {
+    expect(parseComplaintIntentResponse('{"isComplaint": true}').valid).toBe(false);
+  });
+
+  test('rejects isComplaint: true with an empty summary', () => {
+    expect(parseComplaintIntentResponse('{"isComplaint": true, "summary": ""}').valid).toBe(false);
+  });
+
+  test('rejects null/empty input without throwing', () => {
+    expect(parseComplaintIntentResponse(null).valid).toBe(false);
+    expect(parseComplaintIntentResponse('').valid).toBe(false);
   });
 });
 

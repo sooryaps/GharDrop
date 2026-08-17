@@ -272,6 +272,45 @@ function validateOrderQuantity(quantity) {
 
 /**
  * Safely parses and validates the JSON Gemini is asked to return for
+ * complaint-intent detection. Same fail-safe philosophy as
+ * parseOrderIntentResponse — never throws, degrades to "not a complaint"
+ * on any malformed output rather than trusting it blindly.
+ */
+function parseComplaintIntentResponse(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return { valid: false, error: 'Empty or non-string response.' };
+  }
+
+  const stripped = rawText.replace(/```json\s*|```\s*/g, '').trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch (e) {
+    return { valid: false, error: 'Response was not valid JSON.' };
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { valid: false, error: 'Response was not a JSON object.' };
+  }
+
+  if (typeof parsed.isComplaint !== 'boolean') {
+    return { valid: false, error: 'Missing or invalid "isComplaint" field.' };
+  }
+
+  if (!parsed.isComplaint) {
+    return { valid: true, data: { isComplaint: false, summary: '' } };
+  }
+
+  if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
+    return { valid: false, error: 'Missing or invalid "summary" field for a detected complaint.' };
+  }
+
+  return { valid: true, data: { isComplaint: true, summary: parsed.summary.trim() } };
+}
+
+/**
+ * Safely parses and validates the JSON Gemini is asked to return for
  * order-intent detection. Handles the common failure modes of LLM
  * "structured output": markdown code fences around the JSON, extra
  * prose before/after, missing fields, or wrong types. Never throws —
@@ -379,6 +418,7 @@ module.exports = {
   parseItemsWithQuantity,
   formatItemsWithQuantity,
   parseOrderIntentResponse,
+  parseComplaintIntentResponse,
   matchDishName,
   validateStatusTransition,
   VALID_KITCHEN_STATUSES,

@@ -22,6 +22,7 @@ const {
   parseItemsWithQuantity,
   formatItemsWithQuantity,
   parseOrderIntentResponse,
+  parseComplaintIntentResponse,
   matchDishName,
   validateStatusTransition,
   isValidOwnerToken,
@@ -165,6 +166,86 @@ ${availableMenuNames.map((n) => `- ${n}`).join('\n')}
     // instead of an order, never the reverse.
     return { isOrder: false, items: [], unmatchedNames: [] };
   }
+}
+
+// ---- Helper: detects whether an incoming message is a complaint, and if
+// so produces a short summary for logging/notifying the owner. Fails safe
+// to "not a complaint" on any malformed AI output — same philosophy as
+// detectOrderIntent. This function ONLY classifies; it never decides what
+// to do about the complaint (no promises, no fake resolution) — that's
+// handled separately by raiseComplaint, which is deliberately honest and
+// non-committal.
+async function detectComplaintIntent(message) {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: message }] }],
+          systemInstruction: {
+            parts: [
+              {
+                text: `You classify a customer WhatsApp message for a food ordering system. Reply with ONLY raw JSON, no markdown, no explanation, matching exactly this shape:
+{"isComplaint": boolean, "summary": string}
+
+Rules:
+- isComplaint: true if the customer is expressing dissatisfaction, reporting a problem with an order (wrong item, late, cold, bad quality, missing item), or asking for a refund/compensation.
+- Ordinary questions, greetings, or positive feedback are isComplaint: false with an empty summary.
+- If true, "summary" is a short (under 15 words) neutral factual description of the issue, for internal logging — not a reply to the customer.`,
+              },
+            ],
+          },
+          generationConfig: { maxOutputTokens: 256 },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const parsed = parseComplaintIntentResponse(rawText);
+
+    if (!parsed.valid || !parsed.data.isComplaint) {
+      return { isComplaint: false, summary: '' };
+    }
+    return { isComplaint: true, summary: parsed.data.summary };
+  } catch (error) {
+    console.error('Complaint intent detection error:', error);
+    return { isComplaint: false, summary: '' };
+  }
+}
+
+// ---- Helper: logs a real complaint and notifies the owner/team over
+// WhatsApp. Returns an honest, non-committal reply for the customer —
+// deliberately never promises a refund, voucher, or specific resolution,
+// and never invents a reference/complaint number, since the bot has no
+// actual authority to make those commitments.
+async function raiseComplaint(phone, message, summary) {
+  const { data: complaint, error } = await supabase
+    .from('complaints')
+    .insert({ phone, message, summary })
+    .select()
+    .single();
+
+  if (error) {
+    console.log('COMPLAINT LOG FAILED:', error.message);
+  }
+
+  const notifyPhone = process.env.OWNER_NOTIFY_PHONE;
+  if (notifyPhone) {
+    await sendWhatsAppMessage(
+      notifyPhone,
+      `⚠️ New complaint from ${phone}${complaint ? ` (#${complaint.id})` : ''}:\n"${summary}"\n\nFull message: "${message}"`
+    );
+  } else {
+    console.log('OWNER_NOTIFY_PHONE not set — complaint logged but no WhatsApp notification sent.');
+  }
+
+  return "I'm really sorry to hear that. I've passed this along to our team directly and they'll get back to you personally — thank you for your patience.";
 }
 
 // ---- Helper: fetches the last few turns of this phone's recent
@@ -311,7 +392,9 @@ When a customer settles on a dish, feel free to warmly suggest ONE natural pairi
 This customer's past completed orders (use this to personalize naturally, don't list it back robotically):
 ${historyText}
 
-The conversation so far (if any) is provided as prior turns — use it for continuity (e.g. remembering what they just mentioned), don't repeat yourself.`,
+The conversation so far (if any) is provided as prior turns — use it for continuity (e.g. remembering what they just mentioned), don't repeat yourself.
+
+CRITICAL RULE — NEVER BREAK THIS: You have NO authority to promise refunds, discounts, vouchers, or any compensation, and you must NEVER invent a complaint/reference/ticket number. If a customer seems upset or is reporting a problem, respond with genuine warmth and empathy, apologize sincerely, and say the team will personally look into it — but never promise a specific outcome, amount, or timeline, and never make up any kind of number or reference.`,
             },
           ],
         },
@@ -438,7 +521,19 @@ app.post('/webhook', async (req, res) => {
     }
 
     // Not a detected order (or a detected-but-unmatched attempt with no
-    // valid items) — fall back to normal conversational reply.
+    // valid items) — check if this is a complaint before falling back to
+    // general chat, so a genuine problem gets logged and routed to a
+    // human rather than getting an improvised (and possibly overpromising)
+    // conversational reply.
+    const complaintCheck = await detectComplaintIntent(text);
+    if (complaintCheck.isComplaint) {
+      const replyText = await raiseComplaint(from, text, complaintCheck.summary);
+      await sendWhatsAppMessage(from, replyText);
+      await saveChatMessage(from, 'user', text);
+      await saveChatMessage(from, 'assistant', replyText);
+      return;
+    }
+
     const reply = await generateChatReply(text, from);
     await sendWhatsAppMessage(from, reply);
   } catch (error) {
