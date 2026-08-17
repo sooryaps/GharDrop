@@ -4,6 +4,20 @@
 const crypto = require('crypto');
 
 /**
+ * Converts stored short-term chat history rows (role: 'user'|'assistant')
+ * into Gemini's multi-turn `contents` format (role: 'user'|'model'),
+ * with the current message appended as the latest turn. Kept as a pure
+ * function so the mapping logic is testable without a real Gemini call.
+ */
+function buildGeminiContents(historyRows, currentMessage) {
+  const historyContents = (historyRows || []).map((row) => ({
+    role: row.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: row.message }],
+  }));
+  return [...historyContents, { role: 'user', parts: [{ text: currentMessage }] }];
+}
+
+/**
  * Validates a payment amount before creating a Razorpay order.
  * Returns { valid: true } or { valid: false, error: '...' }
  */
@@ -354,6 +368,7 @@ function matchDishName(requestedName, menuNames) {
 module.exports = {
   validateOrderAmount,
   validateChatMessage,
+  buildGeminiContents,
   isDishAvailable,
   validateQuantity,
   validateOrderQuantity,

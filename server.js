@@ -12,6 +12,8 @@ const cron = require('node-cron');
 const {
   validateOrderAmount,
   validateChatMessage,
+  buildGeminiContents,
+  calculateBestSellers,
   validateQuantity,
   validateOrderQuantity,
   validateTicketCapacity,
@@ -165,13 +167,41 @@ ${availableMenuNames.map((n) => `- ${n}`).join('\n')}
   }
 }
 
-// ---- Chat route: talks to Gemini, using live menu + customer history ----
+// ---- Helper: fetches the last few turns of this phone's recent
+// conversation (within the last 2 hours, so an old conversation doesn't
+// bleed into a genuinely new one days later). Bounded to a small count
+// so Gemini's context stays cheap and relevant. ----
+async function getRecentChatHistory(phone) {
+  if (!phone) return [];
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+  const { data } = await supabase
+    .from('chat_history')
+    .select('role, message, created_at')
+    .eq('phone', phone)
+    .gte('created_at', twoHoursAgo)
+    .order('created_at', { ascending: false })
+    .limit(8);
+
+  return (data || []).reverse(); // oldest first, matching conversation order
+}
+
+// ---- Helper: saves one turn (customer message or assistant reply) to
+// short-term chat history. Best-effort — a logging failure here should
+// never break the actual customer-facing reply. ----
+async function saveChatMessage(phone, role, message) {
+  if (!phone) return;
+  const { error } = await supabase.from('chat_history').insert({ phone, role, message });
+  if (error) console.log('CHAT HISTORY SAVE FAILED:', error.message);
+}
+
 // ---- Helper: generates a conversational reply using live menu, deals,
-// semantic search, and customer order history. Extracted so both the
-// public /api/chat route AND the WhatsApp webhook can call this directly
-// — previously the webhook self-called /api/chat over HTTP to localhost,
-// which added an unnecessary network hop and re-triggered the rate
-// limiter against itself. Direct function calls avoid both.
+// semantic search, real best-sellers, and short-term conversation memory.
+// Extracted so both the public /api/chat route AND the WhatsApp webhook
+// can call this directly — previously the webhook self-called /api/chat
+// over HTTP to localhost, which added an unnecessary network hop and
+// re-triggered the rate limiter against itself. Direct function calls
+// avoid both.
 async function generateChatReply(message, phone) {
   const today = new Date().toISOString().split('T')[0];
 
@@ -217,8 +247,22 @@ async function generateChatReply(message, phone) {
     }
   }
 
+  // Real best-sellers, not a guess — same calculateBestSellers used on
+  // the owner dashboard, run against actual recent completed orders, so
+  // the AI can genuinely say "our most loved dish is X" and mean it.
+  const { data: recentOrders } = await supabase
+    .from('orders')
+    .select('items')
+    .eq('status', 'completed')
+    .order('created_at', { ascending: false })
+    .limit(50);
+  const bestSellers = calculateBestSellers(recentOrders || [], 3);
+  const bestSellerText = bestSellers.length > 0
+    ? bestSellers.map((b) => `${b.name} (ordered ${b.count} times recently)`).join(', ')
+    : 'not enough order history yet to say';
+
   const menuText = (availableMenu || [])
-    .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})`)
+    .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})${item.menu_items.description ? ` — ${item.menu_items.description}` : ''}`)
     .join('\n');
 
   const dealText = todaysDeals && todaysDeals.length > 0
@@ -227,6 +271,12 @@ async function generateChatReply(message, phone) {
         .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''} — ${d.remaining_count} left`)
         .join('\n') || 'No special deals available right now (sold out).'
     : 'No special deal today.';
+
+  // Short-term memory: recent turns in THIS conversation (last 2 hours),
+  // separate from historical past-order data above. This is what lets a
+  // reply like "what goes well with that?" actually know what "that" was.
+  const recentHistory = await getRecentChatHistory(phone);
+  const contents = buildGeminiContents(recentHistory, message);
 
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent`,
@@ -237,20 +287,31 @@ async function generateChatReply(message, phone) {
         'x-goog-api-key': process.env.GEMINI_API_KEY,
       },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: message }] }],
+        contents,
         systemInstruction: {
           parts: [
             {
-              text: `You are Ghardrop's ordering assistant. Only recommend dishes from today's actual menu below — never mention anything not listed. Keep replies short, 2-3 sentences, conversational.
+              text: `You are the warm, friendly voice of Ghardrop — a beloved home-run cloud kitchen, like the favorite neighborhood eatery everyone in the area trusts. Talk like a genuinely caring waiter who knows the regulars: warm, a little homely, never robotic or corporate. Use natural, brief phrases like "you'll love this" or "that's one of our favorites" where they fit — but don't overdo it or sound scripted. Keep replies short for WhatsApp — 2-4 sentences.
+
+Only recommend dishes from today's actual menu below — never mention anything not listed.
 
 Today's menu:
-${menuText || 'No menu has been posted yet today — let the customer know to check back soon.'}
-Semantically similar dishes to the customer's query (ONLY mention these if the customer's question is actually about food preferences/taste — ignore this section entirely for greetings or general menu questions):
-${semanticMatches || 'No strong semantic matches found.'}
+${menuText || 'No menu has been posted yet today — let the customer know to check back soon, warmly.'}
+
 ${dealText}
 
-This customer's past orders (use this to personalize recommendations naturally, don't just list it back robotically):
-${historyText}`,
+Our most popular dishes recently: ${bestSellerText}
+— Mention a best-seller naturally ONLY when the customer seems undecided or asks what's good, not on every message.
+
+Semantically similar dishes to the customer's query (ONLY mention these if the customer's question is actually about food preferences/taste — ignore this section entirely for greetings or general menu questions):
+${semanticMatches || 'No strong semantic matches found.'}
+
+When a customer settles on a dish, feel free to warmly suggest ONE natural pairing from today's menu (e.g. a curry to go with a dosa) — but only once, don't stack suggestions onto every reply, and never push it onto someone who's just asking a question or hasn't shown order intent.
+
+This customer's past completed orders (use this to personalize naturally, don't list it back robotically):
+${historyText}
+
+The conversation so far (if any) is provided as prior turns — use it for continuity (e.g. remembering what they just mentioned), don't repeat yourself.`,
             },
           ],
         },
@@ -260,7 +321,14 @@ ${historyText}`,
   );
 
   const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sorry, no response.';
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Sorry, no response.';
+
+  // Save both turns for future short-term context — best-effort, never
+  // blocks the actual reply from reaching the customer.
+  await saveChatMessage(phone, 'user', message);
+  await saveChatMessage(phone, 'assistant', reply);
+
+  return reply;
 }
 
 app.post('/api/chat', async (req, res) => {
@@ -346,17 +414,26 @@ app.post('/webhook', async (req, res) => {
       const itemsString = formatItemsWithQuantity(intent.items);
       const result = await createPaymentLinkForOrder({ items: itemsString, customerPhone: from });
 
+      let replyText;
       if (result.ok) {
-        await sendWhatsAppMessage(
-          from,
-          `Got it! Your order: ${result.items} — ₹${result.totalPrice}.\n\nPay here to confirm: ${result.shortUrl}`
-        );
+        // Itemized, warm receipt — one line per dish, not a flat string.
+        const itemLines = intent.items
+          .map((i) => `• ${i.name}${i.quantity > 1 ? ` x${i.quantity}` : ''}`)
+          .join('\n');
+        replyText = `🧾 Here's your order:\n${itemLines}\n\nTotal: ₹${result.totalPrice}\n\nTap to confirm & pay: ${result.shortUrl}\n\nThank you for ordering with Ghardrop! 🙏`;
       } else {
         // Stock ran out, item unmatched, etc — tell the customer plainly
         // rather than silently failing or falling back to generic chat,
         // since they clearly tried to order something specific.
-        await sendWhatsAppMessage(from, result.error);
+        replyText = result.error;
       }
+      await sendWhatsAppMessage(from, replyText);
+      // Log both turns so short-term memory (used by generateChatReply)
+      // stays complete even when THIS branch handled the message rather
+      // than the conversational one — e.g. "what goes with that?" right
+      // after an order confirmation should still have context.
+      await saveChatMessage(from, 'user', text);
+      await saveChatMessage(from, 'assistant', replyText);
       return;
     }
 

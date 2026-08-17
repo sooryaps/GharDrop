@@ -1,6 +1,7 @@
 const {
   validateOrderAmount,
   validateChatMessage,
+  buildGeminiContents,
   isDishAvailable,
   validateQuantity,
   validateOrderQuantity,
@@ -230,6 +231,40 @@ describe('validateDealComponents', () => {
 
   test('rejects a component with a negative quantity', () => {
     expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: -1 }]).valid).toBe(false);
+  });
+});
+
+// ---- buildGeminiContents ----
+describe('buildGeminiContents', () => {
+  test('appends current message with no history', () => {
+    const result = buildGeminiContents([], 'hi there');
+    expect(result).toEqual([{ role: 'user', parts: [{ text: 'hi there' }] }]);
+  });
+
+  test('maps assistant role to model role', () => {
+    const history = [{ role: 'assistant', message: 'How can I help?' }];
+    const result = buildGeminiContents(history, 'I want dosa');
+    expect(result[0].role).toBe('model');
+  });
+
+  test('maps user role to user role', () => {
+    const history = [{ role: 'user', message: 'hi' }];
+    const result = buildGeminiContents(history, 'I want dosa');
+    expect(result[0].role).toBe('user');
+  });
+
+  test('preserves order and appends current message last', () => {
+    const history = [
+      { role: 'user', message: 'hi' },
+      { role: 'assistant', message: 'Welcome!' },
+    ];
+    const result = buildGeminiContents(history, 'I want 2 dosa');
+    expect(result.map((r) => r.parts[0].text)).toEqual(['hi', 'Welcome!', 'I want 2 dosa']);
+  });
+
+  test('handles null/undefined history without throwing', () => {
+    expect(buildGeminiContents(null, 'hi').length).toBe(1);
+    expect(buildGeminiContents(undefined, 'hi').length).toBe(1);
   });
 });
 
