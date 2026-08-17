@@ -219,15 +219,44 @@ Rules:
   }
 }
 
+// ---- Helper: finds this phone's most recent completed order, within a
+// reasonable window (30 days) — used to verify a complaint actually
+// corresponds to a real purchase, rather than trusting the claim blindly.
+async function findRecentOrderForPhone(phone) {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  const { data } = await supabase
+    .from('orders')
+    .select('id, items, total_price, date')
+    .eq('customer_phone', phone)
+    .eq('status', 'completed')
+    .gte('date', thirtyDaysAgo)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single();
+
+  return data || null;
+}
+
 // ---- Helper: logs a real complaint and notifies the owner/team over
 // WhatsApp. Returns an honest, non-committal reply for the customer —
 // deliberately never promises a refund, voucher, or specific resolution,
 // and never invents a reference/complaint number, since the bot has no
 // actual authority to make those commitments.
+//
+// Verifies the complaint against a real recent order for this phone
+// number BEFORE treating it as confirmed. An unverified complaint is
+// still logged and still notified (never silently suppressed — a genuine
+// customer might have ordered under a different number) but clearly
+// flagged, and the customer is asked for order details rather than given
+// the same reassurance a verified complaint gets.
 async function raiseComplaint(phone, message, summary) {
+  const recentOrder = await findRecentOrderForPhone(phone);
+  const verified = !!recentOrder;
+
   const { data: complaint, error } = await supabase
     .from('complaints')
-    .insert({ phone, message, summary })
+    .insert({ phone, message, summary, verified, order_id: recentOrder ? recentOrder.id : null })
     .select()
     .single();
 
@@ -237,15 +266,23 @@ async function raiseComplaint(phone, message, summary) {
 
   const notifyPhone = process.env.OWNER_NOTIFY_PHONE;
   if (notifyPhone) {
+    const orderContext = recentOrder
+      ? `Matched order #${recentOrder.id}: ${recentOrder.items} (₹${recentOrder.total_price}, ${recentOrder.date})`
+      : '⚠️ UNVERIFIED — no matching order found under this number in the last 30 days.';
     await sendWhatsAppMessage(
       notifyPhone,
-      `⚠️ New complaint from ${phone}${complaint ? ` (#${complaint.id})` : ''}:\n"${summary}"\n\nFull message: "${message}"`
+      `⚠️ New complaint from ${phone}${complaint ? ` (#${complaint.id})` : ''}:\n"${summary}"\n\n${orderContext}\n\nFull message: "${message}"`
     );
   } else {
     console.log('OWNER_NOTIFY_PHONE not set — complaint logged but no WhatsApp notification sent.');
   }
 
-  return "I'm really sorry to hear that. I've passed this along to our team directly and they'll get back to you personally — thank you for your patience.";
+  if (verified) {
+    return "I'm really sorry to hear that. I've passed this along to our team directly and they'll get back to you personally — thank you for your patience.";
+  }
+  // No matching order — ask for details instead of the same reassurance,
+  // so a baseless complaint doesn't get treated identically to a real one.
+  return "I'm sorry to hear that — I couldn't find a recent order under this number though. Could you share your order number, or the phone number you used to order, so our team can look into it properly?";
 }
 
 // ---- Helper: fetches the last few turns of this phone's recent
