@@ -474,6 +474,17 @@ app.post('/webhook', async (req, res) => {
   try {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
+
+    // TEMPORARY DEBUG — Meta sends delivery status updates (sent/
+    // delivered/read/failed) as a SEPARATE payload shape from incoming
+    // messages. These were previously silently ignored, so a delivery
+    // failure to OWNER_NOTIFY_PHONE would never show up anywhere. Logging
+    // this to actually see what's happening, remove once diagnosed.
+    const statuses = change?.value?.statuses;
+    if (statuses && statuses.length > 0) {
+      console.log('WHATSAPP STATUS UPDATE:', JSON.stringify(statuses, null, 2));
+    }
+
     const message = change?.value?.messages?.[0];
 
     if (!message || message.type !== 'text') return;
