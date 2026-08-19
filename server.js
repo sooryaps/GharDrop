@@ -264,18 +264,13 @@ async function raiseComplaint(phone, message, summary) {
     console.log('COMPLAINT LOG FAILED:', error.message);
   }
 
-  const notifyPhone = process.env.OWNER_NOTIFY_PHONE;
-  if (notifyPhone) {
-    const orderContext = recentOrder
-      ? `Matched order #${recentOrder.id}: ${recentOrder.items} (₹${recentOrder.total_price}, ${recentOrder.date})`
-      : '⚠️ UNVERIFIED — no matching order found under this number in the last 30 days.';
-    await sendWhatsAppMessage(
-      notifyPhone,
-      `⚠️ New complaint from ${phone}${complaint ? ` (#${complaint.id})` : ''}:\n"${summary}"\n\n${orderContext}\n\nFull message: "${message}"`
-    );
-  } else {
-    console.log('OWNER_NOTIFY_PHONE not set — complaint logged but no WhatsApp notification sent.');
-  }
+  const orderContext = recentOrder
+    ? `Matched order #${recentOrder.id}: ${recentOrder.items} (₹${recentOrder.total_price}, ${recentOrder.date})`
+    : '⚠️ UNVERIFIED — no matching order found under this number in the last 30 days.';
+  await notifyOwner(
+    verified ? 'New Complaint (verified)' : 'New Complaint (UNVERIFIED)',
+    `From ${phone}${complaint ? ` (#${complaint.id})` : ''}: "${summary}"\n${orderContext}\nFull message: "${message}"`
+  );
 
   if (verified) {
     return "I'm really sorry to hear that. I've passed this along to our team directly and they'll get back to you personally — thank you for your patience.";
@@ -502,6 +497,63 @@ async function sendWhatsAppMessage(to, body) {
   const data = await result.json();
   console.log('WhatsApp send result:', JSON.stringify(data, null, 2));
   return data;
+}
+
+// ---- Helper: sends a WhatsApp message using an approved message
+// TEMPLATE, which bypasses the 24-hour "customer must have messaged
+// first" restriction that plain text messages are subject to. Required
+// for reliably reaching the owner even if they haven't texted the bot
+// recently — the exact failure mode that broke complaint alerts earlier.
+async function sendWhatsAppTemplate(to, templateName, params) {
+  const result = await fetch(
+    `https://graph.facebook.com/v25.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'template',
+        template: {
+          name: templateName,
+          language: { code: 'en' },
+          components: [
+            {
+              type: 'body',
+              parameters: params.map((text) => ({ type: 'text', text })),
+            },
+          ],
+        },
+      }),
+    }
+  );
+  const data = await result.json();
+  console.log('WhatsApp template send result:', JSON.stringify(data, null, 2));
+  return data;
+}
+
+// ---- Helper: the single, shared path for every owner/team alert
+// (complaints, critical failures, etc). Tries the approved template
+// first (works regardless of the 24-hour window); if that fails for any
+// reason (not yet approved, template error, etc), falls back to a plain
+// text message so the alert still has a chance of reaching someone
+// rather than silently vanishing. Logs which path was actually used.
+async function notifyOwner(alertType, details) {
+  const notifyPhone = process.env.OWNER_NOTIFY_PHONE;
+  if (!notifyPhone) {
+    console.log(`OWNER_NOTIFY_PHONE not set — alert not sent. [${alertType}] ${details}`);
+    return;
+  }
+
+  const templateResult = await sendWhatsAppTemplate(notifyPhone, 'ghardrop_alert', [alertType, details]);
+
+  if (templateResult.error) {
+    console.log(`Template send failed (${templateResult.error.message || 'unknown error'}) — falling back to plain text.`);
+    await sendWhatsAppMessage(notifyPhone, `⚠️ Ghardrop Alert\n\nType: ${alertType}\nDetails: ${details}`);
+  }
 }
 
 // ---- WhatsApp incoming messages (Meta calls this every time, POST) ----
@@ -895,6 +947,10 @@ app.post('/razorpay-webhook', async (req, res) => {
 
   if (insertError) {
     console.log('ORDER INSERT FAILED:', insertError.message);
+    await notifyOwner(
+      'ORDER INSERT FAILED',
+      `Payment of ₹${amountRupees} from ${customerPhone} succeeded but the order record failed to save: ${insertError.message}. Items: ${items}`
+    );
   } else {
     console.log('Order successfully inserted into database.');
 
@@ -930,6 +986,10 @@ app.post('/razorpay-webhook', async (req, res) => {
           // between checkout and this webhook (race condition). This is
           // a real oversell that needs a human, not a silent failure.
           console.log(`OVERSOLD: ${dishName} x${quantity} — payment captured but insufficient stock at decrement time. Manual review needed for order from ${customerPhone}.`);
+          await notifyOwner(
+            'STOCK OVERSOLD',
+            `${dishName} x${quantity} — payment of ₹${amountRupees} from ${customerPhone} succeeded but stock ran out. Manual review needed.`
+          );
         }
       }
     }
@@ -948,6 +1008,10 @@ app.post('/razorpay-webhook', async (req, res) => {
         console.log(`DEAL TICKET DECREMENT FAILED for deal ${dealId}:`, dealTicketError.message);
       } else if (!dealDecremented) {
         console.log(`DEAL OVERSOLD: deal ${dealId} — payment captured but deal was already at 0 remaining. Manual review needed for order from ${customerPhone}.`);
+        await notifyOwner(
+          'DEAL OVERSOLD',
+          `Deal #${dealId} — payment of ₹${amountRupees} from ${customerPhone} succeeded but the deal was already sold out. Manual review needed.`
+        );
       }
     }
 
@@ -1405,6 +1469,17 @@ app.get('/api/dashboard', requireOwnerAuth, async (req, res) => {
 // ---- Owner dashboard uses this to move an order through the kitchen
 // lifecycle: pending -> preparing -> ready -> delivered (or -> cancelled
 // from pending/preparing). Rejects illegal jumps via validateStatusTransition.
+// ---- Status-specific customer-facing messages. Cancellation deliberately
+// doesn't promise a refund — that workflow doesn't exist yet, and
+// promising one here would repeat the exact over-promising problem the
+// chat prompt was fixed to avoid.
+const CUSTOMER_STATUS_MESSAGES = {
+  preparing: (items) => `👩‍🍳 Good news — we've started preparing your order: ${items}!`,
+  ready: (items) => `🎉 Your order is ready: ${items}!`,
+  delivered: (items) => `✅ Order delivered — hope you enjoy: ${items}! We'd love to hear how it was.`,
+  cancelled: (items) => `Your order (${items}) has been cancelled. Reply here if you have any questions.`,
+};
+
 app.patch('/api/orders/:id/status', requireOwnerAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1412,7 +1487,7 @@ app.patch('/api/orders/:id/status', requireOwnerAuth, async (req, res) => {
 
     const { data: order, error: fetchError } = await supabase
       .from('orders')
-      .select('id, kitchen_status')
+      .select('id, kitchen_status, customer_phone, items')
       .eq('id', id)
       .single();
 
@@ -1433,6 +1508,18 @@ app.patch('/api/orders/:id/status', requireOwnerAuth, async (req, res) => {
     if (updateError) {
       console.log('ORDER STATUS UPDATE FAILED:', updateError.message);
       return res.status(500).json({ error: 'Could not update order status.' });
+    }
+
+    // Notify the customer directly — best-effort. A messaging failure
+    // here (e.g. the rare case of a non-WhatsApp-originated test order)
+    // should never fail the actual status update.
+    const messageBuilder = CUSTOMER_STATUS_MESSAGES[newStatus];
+    if (messageBuilder && order.customer_phone) {
+      try {
+        await sendWhatsAppMessage(order.customer_phone, messageBuilder(order.items));
+      } catch (notifyError) {
+        console.log(`Customer status notification failed for order #${id}:`, notifyError.message);
+      }
     }
 
     res.json({ success: true, id, kitchen_status: newStatus });
