@@ -1414,6 +1414,55 @@ app.get('/api/kitchen-orders', requireOwnerAuth, async (req, res) => {
   }
 });
 
+// ---- Lists complaints for the dashboard. Defaults to open only (what
+// actually needs attention); ?status=all shows everything including
+// resolved, for a historical view. ----
+app.get('/api/complaints', requireOwnerAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('complaints')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (req.query.status !== 'all') {
+      query = query.eq('status', 'open');
+    }
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ complaints: data || [] });
+  } catch (error) {
+    console.error('Complaints list route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ---- Marks a complaint resolved, with an optional note for real
+// record-keeping (e.g. "explained the mix-up, refunded manually via UPI"). ----
+app.patch('/api/complaints/:id/resolve', requireOwnerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { note } = req.body;
+
+    const { data, error } = await supabase
+      .from('complaints')
+      .update({ status: 'resolved', resolution_note: note || null })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(error ? 500 : 404).json({ error: error ? 'Could not resolve complaint.' : 'Complaint not found.' });
+    }
+
+    res.json({ success: true, complaint: data });
+  } catch (error) {
+    console.error('Resolve complaint route error:', error);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // ---- Powers the owner dashboard: recent orders, revenue, best-sellers, today's tickets ----
 app.get('/api/dashboard', requireOwnerAuth, async (req, res) => {
   try {
