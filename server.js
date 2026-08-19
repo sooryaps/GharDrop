@@ -564,14 +564,18 @@ app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
 
-    // TEMPORARY DEBUG — Meta sends delivery status updates (sent/
-    // delivered/read/failed) as a SEPARATE payload shape from incoming
-    // messages. These were previously silently ignored, so a delivery
-    // failure to OWNER_NOTIFY_PHONE would never show up anywhere. Logging
-    // this to actually see what's happening, remove once diagnosed.
+    // Meta sends delivery status updates (sent/delivered/read/failed) as
+    // a SEPARATE payload shape from incoming messages. Logging failures
+    // specifically (not every sent/delivered/read event, to avoid noise)
+    // gives ongoing visibility into silent delivery problems — this is
+    // how the 24-hour re-engagement window issue got diagnosed earlier,
+    // and keeping it means the next delivery failure won't be invisible.
     const statuses = change?.value?.statuses;
     if (statuses && statuses.length > 0) {
-      console.log('WHATSAPP STATUS UPDATE:', JSON.stringify(statuses, null, 2));
+      const failed = statuses.filter((s) => s.status === 'failed');
+      if (failed.length > 0) {
+        console.log('WHATSAPP DELIVERY FAILED:', JSON.stringify(failed, null, 2));
+      }
     }
 
     const message = change?.value?.messages?.[0];
@@ -846,6 +850,13 @@ async function createPaymentLinkForOrder({ items, customerPhone, dealId }) {
     customer: { contact: customerPhone },
     notify: { sms: false, whatsapp: false }, // WE send it via WhatsApp ourselves, not Razorpay
     notes: { items: priced.canonicalItemsString, customerPhone, dealId: priced.dealId ? String(priced.dealId) : '' },
+    // Expires in 30 minutes — without this, an unpaid link stays valid
+    // indefinitely, so someone could pay days later against stock/deal
+    // availability that's since changed. Stock is still re-verified live
+    // when the webhook actually processes payment, but a short expiry
+    // avoids customer confusion from a stale link more than it avoids a
+    // stock bug.
+    expire_by: Math.floor(Date.now() / 1000) + 30 * 60,
   });
 
   return {
@@ -934,8 +945,27 @@ app.post('/razorpay-webhook', async (req, res) => {
   const amountRupees = payment.amount / 100;
   const today = new Date().toISOString().split('T')[0];
   const wasDealOrder = !!dealId;
+  const razorpayPaymentId = payment.id;
 
   console.log(`Payment confirmed: ₹${amountRupees} from ${customerPhone} for ${items}${wasDealOrder ? ` (DEAL id ${dealId})` : ''}`);
+
+  // Idempotency check: Razorpay can retry a webhook delivery (network
+  // timeout, slow response, etc). Without this, a retry would insert a
+  // SECOND order and decrement stock/tickets a second time for one real
+  // payment. Checked here AND enforced at the DB level via a unique
+  // constraint on razorpay_payment_id — the constraint is the real
+  // safety net for a genuine race between two near-simultaneous
+  // deliveries; this check just avoids the wasted work in the common case.
+  const { data: existingOrder } = await supabase
+    .from('orders')
+    .select('id')
+    .eq('razorpay_payment_id', razorpayPaymentId)
+    .maybeSingle();
+
+  if (existingOrder) {
+    console.log(`DUPLICATE WEBHOOK: payment ${razorpayPaymentId} already processed as order #${existingOrder.id} — skipping.`);
+    return;
+  }
 
   const { error: insertError } = await supabase.from('orders').insert({
     customer_phone: customerPhone,
@@ -943,7 +973,18 @@ app.post('/razorpay-webhook', async (req, res) => {
     total_price: amountRupees,
     status: 'completed',
     date: today,
+    razorpay_payment_id: razorpayPaymentId,
   });
+
+  // A unique-constraint violation here (Postgres code 23505) means a
+  // concurrent duplicate delivery slipped past the check above and lost
+  // the race at the DB level — that's the constraint doing its job, not
+  // a real failure. Anything else is a genuine insert failure worth
+  // alerting on.
+  if (insertError && insertError.code === '23505') {
+    console.log(`DUPLICATE WEBHOOK (caught at DB level): payment ${razorpayPaymentId} — skipping.`);
+    return;
+  }
 
   if (insertError) {
     console.log('ORDER INSERT FAILED:', insertError.message);
