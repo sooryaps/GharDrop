@@ -19,6 +19,7 @@ const {
   validateTicketCapacity,
   validateDealComponents,
   generateDealTitle,
+  classifyConfirmationReply,
   validateRating,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
@@ -561,6 +562,35 @@ async function notifyOwner(alertType, details) {
   }
 }
 
+// ---- Pending-order helpers: a detected order isn't paid immediately —
+// it's held here until the customer explicitly confirms. Expires after
+// 15 minutes so a stale, forgotten order can't suddenly be confirmed
+// hours later against since-changed stock/prices.
+const PENDING_ORDER_EXPIRY_MINUTES = 15;
+
+async function getPendingOrder(phone) {
+  const { data } = await supabase.from('pending_orders').select('*').eq('phone', phone).maybeSingle();
+  if (!data) return null;
+  const ageMinutes = (Date.now() - new Date(data.created_at).getTime()) / 60000;
+  if (ageMinutes > PENDING_ORDER_EXPIRY_MINUTES) {
+    await supabase.from('pending_orders').delete().eq('phone', phone);
+    return null;
+  }
+  return data;
+}
+
+async function setPendingOrder(phone, items) {
+  await supabase.from('pending_orders').upsert({ phone, items, created_at: new Date().toISOString() });
+}
+
+async function clearPendingOrder(phone) {
+  await supabase.from('pending_orders').delete().eq('phone', phone);
+}
+
+function formatOrderSummary(items) {
+  return items.map((i) => `• ${i.name}${i.quantity > 1 ? ` x${i.quantity}` : ''}`).join('\n');
+}
+
 // ---- WhatsApp incoming messages (Meta calls this every time, POST) ----
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200); // acknowledge immediately
@@ -592,6 +622,47 @@ app.post('/webhook', async (req, res) => {
     console.log(`Message from ${from}: ${text}`);
 
     const today = new Date().toISOString().split('T')[0];
+
+    // ---- Step 1: is there already a pending (unconfirmed) order for
+    // this phone? If so, this message is likely a reply to it. ----
+    const pending = await getPendingOrder(from);
+
+    if (pending) {
+      const classification = classifyConfirmationReply(text);
+
+      if (classification === 'confirm') {
+        // Re-validate fresh at the moment of actual confirmation — stock
+        // or price may have changed since the order was first suggested.
+        const itemsString = formatItemsWithQuantity(pending.items);
+        const result = await createPaymentLinkForOrder({ items: itemsString, customerPhone: from });
+        await clearPendingOrder(from);
+
+        const replyText = result.ok
+          ? `🧾 Confirmed! Here's your order:\n${formatOrderSummary(pending.items)}\n\nTotal: ₹${result.totalPrice}\n\nTap to pay: ${result.shortUrl}\n\nThank you for ordering with Ghardrop! 🙏`
+          : result.error; // e.g. something sold out in the meantime
+        await sendWhatsAppMessage(from, replyText);
+        await saveChatMessage(from, 'user', text);
+        await saveChatMessage(from, 'assistant', replyText);
+        return;
+      }
+
+      if (classification === 'cancel') {
+        await clearPendingOrder(from);
+        const replyText = "No problem, I've cancelled that. Let me know whenever you're ready to order!";
+        await sendWhatsAppMessage(from, replyText);
+        await saveChatMessage(from, 'user', text);
+        await saveChatMessage(from, 'assistant', replyText);
+        return;
+      }
+      // classification === 'unclear' — could be a change to the order,
+      // or an unrelated question while it's still pending. Falls through
+      // to normal order-intent detection below: if THIS message resolves
+      // to real items, it replaces the pending order (handled in Step 2).
+      // If not, the pending order is simply left untouched and the
+      // message is handled as ordinary chat/complaint — the customer can
+      // still confirm or cancel it in a later message.
+    }
+
     const { data: todaysMenu } = await supabase
       .from('daily_menu')
       .select('quantity_available, menu_items(name)')
@@ -603,21 +674,21 @@ app.post('/webhook', async (req, res) => {
     const intent = await detectOrderIntent(text, availableMenuNames);
 
     if (intent.isOrder && intent.items.length > 0) {
+      // ---- Step 2: an order was detected. Validate it for real (price +
+      // stock) so the confirmation preview is accurate, but do NOT create
+      // a payment link yet — that only happens on explicit confirmation. ----
       const itemsString = formatItemsWithQuantity(intent.items);
-      const result = await createPaymentLinkForOrder({ items: itemsString, customerPhone: from });
+      const priced = await validateAndPriceOrder(itemsString, today);
 
       let replyText;
-      if (result.ok) {
-        // Itemized, warm receipt — one line per dish, not a flat string.
-        const itemLines = intent.items
-          .map((i) => `• ${i.name}${i.quantity > 1 ? ` x${i.quantity}` : ''}`)
-          .join('\n');
-        replyText = `🧾 Here's your order:\n${itemLines}\n\nTotal: ₹${result.totalPrice}\n\nTap to confirm & pay: ${result.shortUrl}\n\nThank you for ordering with Ghardrop! 🙏`;
+      if (priced.ok) {
+        await setPendingOrder(from, intent.items);
+        replyText = `Here's what I have:\n${formatOrderSummary(intent.items)}\n\nTotal: ₹${priced.totalPrice}\n\nShall I send the payment link? Reply *yes* to confirm, or tell me if you'd like to change anything.`;
       } else {
-        // Stock ran out, item unmatched, etc — tell the customer plainly
-        // rather than silently failing or falling back to generic chat,
-        // since they clearly tried to order something specific.
-        replyText = result.error;
+        // Stock ran out, item unmatched, etc — tell the customer plainly,
+        // no pending order gets created for something that can't be
+        // fulfilled anyway.
+        replyText = priced.error;
       }
       await sendWhatsAppMessage(from, replyText);
       // Log both turns so short-term memory (used by generateChatReply)

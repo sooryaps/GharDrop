@@ -8,6 +8,7 @@ const {
   validateTicketCapacity,
   validateDealComponents,
   generateDealTitle,
+  classifyConfirmationReply,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,
@@ -296,6 +297,43 @@ describe('generateDealTitle', () => {
   test('returns a fallback for empty/missing input', () => {
     expect(generateDealTitle([])).toBe('Combo');
     expect(generateDealTitle(null)).toBe('Combo');
+  });
+});
+
+// ---- classifyConfirmationReply ----
+describe('classifyConfirmationReply', () => {
+  test('recognizes plain "yes"', () => {
+    expect(classifyConfirmationReply('yes')).toBe('confirm');
+  });
+
+  test('recognizes "yes" with punctuation/casing variance', () => {
+    expect(classifyConfirmationReply('Yes!')).toBe('confirm');
+    expect(classifyConfirmationReply('  YEP  ')).toBe('confirm');
+  });
+
+  test('recognizes common confirm phrases', () => {
+    expect(classifyConfirmationReply('go ahead')).toBe('confirm');
+    expect(classifyConfirmationReply('sounds good')).toBe('confirm');
+  });
+
+  test('recognizes plain "no" and cancel phrases', () => {
+    expect(classifyConfirmationReply('no')).toBe('cancel');
+    expect(classifyConfirmationReply('cancel')).toBe('cancel');
+    expect(classifyConfirmationReply('never mind')).toBe('cancel');
+  });
+
+  test('CRITICAL: does not misread "yes but change X" as a plain confirmation', () => {
+    expect(classifyConfirmationReply('yes but change the tea to coffee')).toBe('unclear');
+  });
+
+  test('treats a message describing new items as unclear (not confirm/cancel)', () => {
+    expect(classifyConfirmationReply('actually 3 dosas instead')).toBe('unclear');
+  });
+
+  test('handles empty/missing input without throwing', () => {
+    expect(classifyConfirmationReply('')).toBe('unclear');
+    expect(classifyConfirmationReply(null)).toBe('unclear');
+    expect(classifyConfirmationReply(undefined)).toBe('unclear');
   });
 });
 

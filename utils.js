@@ -102,6 +102,34 @@ function isDishAvailable(quantityAvailable) {
 }
 
 /**
+ * Classifies a reply to a pending-order confirmation prompt as
+ * 'confirm', 'cancel', or 'unclear'. Deliberately conservative — matches
+ * only against a whitelist of clean, unambiguous phrases (after
+ * normalizing case/punctuation), NOT a substring search. A message like
+ * "yes but change the tea to coffee" must NOT match 'confirm', since it's
+ * actually describing a change — substring matching on "yes" would get
+ * this wrong. Anything not clearly one or the other returns 'unclear',
+ * which the caller treats as "re-describe the order" rather than risking
+ * an accidental confirmation or cancellation.
+ */
+const CONFIRM_PHRASES = new Set([
+  'yes', 'yeah', 'yep', 'yup', 'confirm', 'confirmed', 'correct', 'right',
+  'ok', 'okay', 'proceed', 'go ahead', 'send it', 'sounds good',
+  'thats right', 'that is right', 'perfect', 'yes please', 'yes confirm',
+]);
+const CANCEL_PHRASES = new Set([
+  'no', 'cancel', 'nevermind', 'never mind', 'stop', 'not now', 'no thanks',
+]);
+
+function classifyConfirmationReply(message) {
+  if (!message || typeof message !== 'string') return 'unclear';
+  const normalized = message.trim().toLowerCase().replace(/[^\w\s]/g, '');
+  if (CONFIRM_PHRASES.has(normalized)) return 'confirm';
+  if (CANCEL_PHRASES.has(normalized)) return 'cancel';
+  return 'unclear';
+}
+
+/**
  * Validates a quantity value before it's inserted into daily_menu.
  * Rejects (rather than silently clamping) so bad input surfaces as an
  * error the owner can fix, instead of quietly becoming 0.
@@ -427,6 +455,7 @@ module.exports = {
   validateTicketCapacity,
   validateDealComponents,
   generateDealTitle,
+  classifyConfirmationReply,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,
