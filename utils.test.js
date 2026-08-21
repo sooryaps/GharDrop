@@ -7,6 +7,7 @@ const {
   validateOrderQuantity,
   validateTicketCapacity,
   validateDealComponents,
+  generateDealTitle,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,
@@ -246,8 +247,8 @@ describe('validateTicketCapacity', () => {
 
 // ---- validateDealComponents ----
 describe('validateDealComponents', () => {
-  test('accepts a valid single-component deal', () => {
-    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 1 }]).valid).toBe(true);
+  test('rejects a single-component deal (a deal is a combo of 2+ now)', () => {
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 1 }]).valid).toBe(false);
   });
 
   test('accepts a valid multi-component deal', () => {
@@ -268,15 +269,33 @@ describe('validateDealComponents', () => {
   });
 
   test('rejects a component missing a name', () => {
-    expect(validateDealComponents([{ quantity: 1 }]).valid).toBe(false);
+    expect(validateDealComponents([{ quantity: 1 }, { name: 'Rice', quantity: 1 }]).valid).toBe(false);
   });
 
   test('rejects a component with an invalid (zero) quantity', () => {
-    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 0 }]).valid).toBe(false);
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: 0 }, { name: 'Rice', quantity: 1 }]).valid).toBe(false);
   });
 
   test('rejects a component with a negative quantity', () => {
-    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: -1 }]).valid).toBe(false);
+    expect(validateDealComponents([{ name: 'Neer Dosa (4pc)', quantity: -1 }, { name: 'Rice', quantity: 1 }]).valid).toBe(false);
+  });
+});
+
+// ---- generateDealTitle ----
+describe('generateDealTitle', () => {
+  test('joins two component names with " + "', () => {
+    const components = [{ name: 'Neer Dosa (4pc)', quantity: 1 }, { name: 'Boiled Red Rice', quantity: 1 }];
+    expect(generateDealTitle(components)).toBe('Neer Dosa (4pc) + Boiled Red Rice');
+  });
+
+  test('joins three component names correctly', () => {
+    const components = [{ name: 'A' }, { name: 'B' }, { name: 'C' }];
+    expect(generateDealTitle(components)).toBe('A + B + C');
+  });
+
+  test('returns a fallback for empty/missing input', () => {
+    expect(generateDealTitle([])).toBe('Combo');
+    expect(generateDealTitle(null)).toBe('Combo');
   });
 });
 

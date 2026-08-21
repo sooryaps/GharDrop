@@ -63,15 +63,16 @@ function validateTicketCapacity(value) {
 /**
  * Validates a deal's structured component list — the real dishes+quantities
  * that make up the deal (e.g. Sunday Thali = 1x Neer Dosa + 1x Rice).
- * Requires at least one component, and every component to have a real
- * name and a valid order-style quantity (>=1). This structure is what
- * downstream checkout logic uses to decrement real dish stock alongside
- * the deal's own ticket count — free-text deal descriptions can't safely
- * drive an atomic stock decrement, so this is the actual source of truth.
+ * Requires AT LEAST TWO dishes — a deal is defined as a combo of 2+ dishes
+ * at a bundle price, not a discount on a single item. Every component
+ * needs a real name and a valid order-style quantity (>=1). This
+ * structure is what downstream checkout logic uses to decrement real
+ * dish stock — free-text deal descriptions can't safely drive an atomic
+ * stock decrement, so this is the actual source of truth.
  */
 function validateDealComponents(components) {
-  if (!Array.isArray(components) || components.length === 0) {
-    return { valid: false, error: 'A deal needs at least one component dish.' };
+  if (!Array.isArray(components) || components.length < 2) {
+    return { valid: false, error: 'A deal needs at least two dishes bundled together.' };
   }
   for (const component of components) {
     if (!component || typeof component.name !== 'string' || component.name.trim().length === 0) {
@@ -84,6 +85,18 @@ function validateDealComponents(components) {
   }
   return { valid: true };
 }
+
+/**
+ * Auto-generates a deal title from its components when the owner leaves
+ * the title blank, e.g. "Neer Dosa (4pc) + Boiled Red Rice". Removes the
+ * requirement to type a name for every combo — a real friction point in
+ * the previous UI.
+ */
+function generateDealTitle(components) {
+  if (!Array.isArray(components) || components.length === 0) return 'Combo';
+  return components.map((c) => c.name).join(' + ');
+}
+
 function isDishAvailable(quantityAvailable) {
   return quantityAvailable > 0;
 }
@@ -413,6 +426,7 @@ module.exports = {
   validateOrderQuantity,
   validateTicketCapacity,
   validateDealComponents,
+  generateDealTitle,
   validateRating,
   parseItemsString,
   parseItemsWithQuantity,

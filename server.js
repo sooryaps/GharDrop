@@ -18,6 +18,7 @@ const {
   validateOrderQuantity,
   validateTicketCapacity,
   validateDealComponents,
+  generateDealTitle,
   validateRating,
   parseItemsWithQuantity,
   formatItemsWithQuantity,
@@ -378,11 +379,15 @@ async function generateChatReply(message, phone) {
     .map((item) => `- ${item.menu_items.name}: ₹${item.price_today} (${item.menu_items.tags})${item.menu_items.description ? ` — ${item.menu_items.description}` : ''}`)
     .join('\n');
 
+  const availableDishNames = (availableMenu || []).map((item) => item.menu_items.name);
   const dealText = todaysDeals && todaysDeals.length > 0
     ? todaysDeals
-        .filter((d) => d.remaining_count > 0)
-        .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''} — ${d.remaining_count} left`)
-        .join('\n') || 'No special deals available right now (sold out).'
+        // A deal is only worth mentioning if every one of its component
+        // dishes is actually still in stock today — no separate deal
+        // counter exists anymore, so this is the real, live check.
+        .filter((d) => Array.isArray(d.components) && d.components.every((c) => availableDishNames.includes(c.name)))
+        .map((d) => `- Today's deal "${d.title}": ${d.items} for ₹${d.price}${d.original_price ? ` (normally ₹${d.original_price})` : ''}`)
+        .join('\n') || 'No special deals available right now (out of stock).'
     : 'No special deal today.';
 
   // Short-term memory: recent turns in THIS conversation (last 2 hours),
@@ -697,9 +702,10 @@ async function resolveDealOrder(dealId, today) {
     // link/reference held onto after the deal expired.
     return { ok: false, status: 410, error: 'That deal is no longer available (expired).' };
   }
-  if (deal.remaining_count <= 0) {
-    return { ok: false, status: 409, error: `Sorry, "${deal.title}" is sold out.` };
-  }
+  // No separate deal capacity check — a deal is sellable exactly as long
+  // as its component dishes have real stock, checked below via the same
+  // resolveOrderItems gate a regular order uses. One less counter to
+  // manage, and no way for it to drift out of sync with real inventory.
   if (!Array.isArray(deal.components) || deal.components.length === 0) {
     // Data integrity issue, not a customer error — log for investigation.
     console.log(`DEAL MISCONFIGURED: deal id ${deal.id} for ${today} has no components.`);
@@ -1035,26 +1041,11 @@ app.post('/razorpay-webhook', async (req, res) => {
       }
     }
 
-    if (wasDealOrder) {
-      // Atomic, same pattern as decrement_ticket — refuses to go below 0
-      // even under concurrent deal payments. This is IN ADDITION TO the
-      // per-dish decrement above, which already covers the deal's
-      // component dishes correctly since `items` contains them. Keyed by
-      // the specific dealId (not date) now that multiple deals per day
-      // are supported.
-      const { data: dealDecremented, error: dealTicketError } = await supabase.rpc('decrement_deal_ticket', {
-        row_id: Number(dealId),
-      });
-      if (dealTicketError) {
-        console.log(`DEAL TICKET DECREMENT FAILED for deal ${dealId}:`, dealTicketError.message);
-      } else if (!dealDecremented) {
-        console.log(`DEAL OVERSOLD: deal ${dealId} — payment captured but deal was already at 0 remaining. Manual review needed for order from ${customerPhone}.`);
-        await notifyOwner(
-          'DEAL OVERSOLD',
-          `Deal #${dealId} — payment of ₹${amountRupees} from ${customerPhone} succeeded but the deal was already sold out. Manual review needed.`
-        );
-      }
-    }
+    // No separate deal ticket decrement — deals no longer have their own
+    // capacity counter. The per-dish decrement loop above already
+    // correctly covers every deal's component dishes (they're included
+    // in `items`), so a deal purchase decrements real ingredient stock
+    // the same way any order does, with nothing extra to keep in sync.
 
     if (newOrder) {
       setTimeout(() => {
@@ -1121,19 +1112,9 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
     const validatedDeals = [];
 
     for (const deal of dealsToValidate) {
-      if (!deal.title || typeof deal.title !== 'string' || deal.title.trim().length === 0) {
-        return res.status(400).json({ error: 'Every deal needs a title.' });
-      }
-
-      const dealCapacityToUse = deal.capacity === undefined || deal.capacity === null ? 25 : deal.capacity;
-      const dealCapacityCheck = validateTicketCapacity(dealCapacityToUse);
-      if (!dealCapacityCheck.valid) {
-        return res.status(400).json({ error: `Invalid capacity for deal "${deal.title}": ${dealCapacityCheck.error}` });
-      }
-
       const componentsCheck = validateDealComponents(deal.components);
       if (!componentsCheck.valid) {
-        return res.status(400).json({ error: `Deal "${deal.title}": ${componentsCheck.error}` });
+        return res.status(400).json({ error: `Deal error: ${componentsCheck.error}` });
       }
 
       const unknownComponents = deal.components
@@ -1141,21 +1122,27 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
         .filter((name) => !matchDishName(name, todaysCheckedNames));
       if (unknownComponents.length > 0) {
         return res.status(400).json({
-          error: `Deal "${deal.title}" components must be dishes checked in today's menu. Not found: ${unknownComponents.join(', ')}`,
+          error: `Deal components must be dishes checked in today's menu. Not found: ${unknownComponents.join(', ')}`,
         });
       }
 
       const priceCheck = validateOrderAmount(deal.price);
       if (!priceCheck.valid) {
-        return res.status(400).json({ error: `Invalid price for deal "${deal.title}": ${priceCheck.error}` });
+        return res.status(400).json({ error: `Invalid deal price: ${priceCheck.error}` });
       }
 
+      // Title is optional — auto-generated from the component dish names
+      // if the owner left it blank, removing a real friction point from
+      // the previous flow.
+      const title = deal.title && deal.title.trim().length > 0
+        ? deal.title.trim()
+        : generateDealTitle(deal.components);
+
       validatedDeals.push({
-        title: deal.title.trim(),
+        title,
         components: deal.components,
         price: deal.price,
         originalPrice: deal.originalPrice || null,
-        capacity: dealCapacityToUse,
       });
     }
 
@@ -1189,8 +1176,9 @@ app.post('/api/daily-menu', requireOwnerAuth, async (req, res) => {
         components: deal.components,
         price: deal.price,
         original_price: deal.originalPrice,
-        total_capacity: deal.capacity,
-        remaining_count: deal.capacity,
+        // No total_capacity/remaining_count — a deal's sellability is
+        // determined live from its component dishes' real stock, not a
+        // separate counter that could drift out of sync.
       }));
       const { error: dealError } = await supabase.from('daily_deals').insert(dealRows);
       if (dealError) {
@@ -1421,7 +1409,6 @@ app.get('/api/daily-menu/yesterday', requireOwnerAuth, async (req, res) => {
       components: deal.components,
       price: deal.price,
       originalPrice: deal.original_price,
-      capacity: deal.total_capacity,
     }));
 
     res.json({ date: yesterday, items, deals });
